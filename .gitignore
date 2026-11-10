@@ -1,0 +1,22 @@
+# Personal state, logs and chat-derived content - never commit these.
+#
+# config.json      your chat_url, default_dir and model choice
+# state.json       which orders/files this machine has already handled
+# inbox/ downloads/ outbox/ terminals/   real work orders and files from the chat
+# *.log *.out *.pid *.lock               runtime noise
+
+config.json
+state.json
+watcher.log
+watcher.out
+watcher.pid
+watcher.lock
+terminal.log
+
+inbox/
+downloads/
+outbox/
+terminals/
+
+__pycache__/
+*.pyc
