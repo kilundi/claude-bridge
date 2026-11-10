@@ -366,7 +366,12 @@ ask-claude --new-chat "context: <handoff summary>"  # fresh chat, seeded with yo
 and prints it. A new Claude has no memory of the old thread, so give it the
 handoff summary as the message (or paste it yourself and re-run `--save-chat`).
 `--save-chat` alone still means "remember the chat that is open in the bridge
-window" - it reads the tab as it is and never navigates it.
+window" - it reads the tab as it is and never navigates it. To move back to an
+older chat (or to any chat you have a link to):
+
+```bash
+ask-claude --goto "https://claude.ai/chat/<id>" --save-chat
+```
 
 Details worth knowing:
 
