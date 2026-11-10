@@ -27,6 +27,9 @@ case "$CMD" in
     ;;
   status)
     if running; then echo "watcher running (pid $(cat "$PID"))"; else echo "watcher not running"; fi
+    if [ -f "$HERE/NEEDS-ORDER.md" ]; then
+      echo "STALLED: the queue needs an order from Claude - see $HERE/NEEDS-ORDER.md"
+    fi
     echo "--- last log lines ---"
     tail -n 8 "$HERE/watcher.log" 2>/dev/null || echo "(no log yet)"
     ;;

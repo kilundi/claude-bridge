@@ -21,6 +21,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -31,7 +32,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import wlock  # noqa: E402
-from bridge import Bridge, cdp_alive, ensure_chrome, extract_work_orders, outbox_files  # noqa: E402
+from bridge import (Bridge, ClaudeUnavailable, cdp_alive, ensure_chrome,  # noqa: E402
+                    extract_work_orders, order_problems, outbox_files)
 
 CONFIG = os.path.join(HERE, "config.json")
 STATE = os.path.join(HERE, "state.json")
@@ -39,6 +41,9 @@ INBOX = os.path.join(HERE, "inbox")
 LOG = os.path.join(HERE, "watcher.log")
 TERMINAL_LOG = os.path.join(HERE, "terminal.log")
 LOCK = os.path.join(HERE, "watcher.lock")
+DOWNLOADS = os.path.join(HERE, "downloads")
+# written when a turn is stalled and Claude did not answer the one automatic ask
+NEEDS_ORDER = os.path.join(HERE, "NEEDS-ORDER.md")
 
 # how many times start_agent may be retried after the first failure, and how
 # long to wait between attempts (overridable from config.json watch settings)
@@ -66,6 +71,14 @@ def log(msg: str) -> None:
             fh.write(line + "\n")
     except Exception:
         pass
+
+
+def quiet(st: dict, why: str) -> None:
+    """Say a non-action once, not once every 30 seconds."""
+    nudge = st.setdefault("nudge", {"streak": 0})
+    if nudge.get("last_wait") != why:
+        nudge["last_wait"] = why
+        log("  %s" % why)
 
 
 def load_state() -> dict:
@@ -150,6 +163,320 @@ def oc_api(binpath: str, method: str, path: str, payload: dict | None = None, ti
         return {"raw": p.stdout}
 
 
+# --- order quality: never start an agent on half a brief -----------------------------
+# The protocol is a template, not a memory test.  A work order has to arrive
+# complete; when it does not - or when Claude only *says* it will do the work and
+# no order follows - the watcher asks for exactly what is missing, once, and then
+# says so loudly instead of waiting forever.  None of this depends on Claude
+# remembering the format as a conversation grows.
+
+# future/continuous intent: "I'm fixing ...", "I'll post the order", "next up".
+# Past tense ("I've fixed ...") and plain reports must not match - those are
+# finished work, not a sign that an order is coming.
+PROMISE_RE = re.compile(
+    r"\b(?:"
+    r"i(?:'m| am|'ll| will)\s+(?:\w+\s+){0,2}(?:fix|fixing|write|writing|implement|implementing|"
+    r"build|building|draft|drafting|post|posting|send|sending|start|starting|do|doing|run|running|"
+    r"move|moving|add|adding|take|taking|pick|picking|switch|switching|create|creating|begin|beginning)"
+    r"|i(?:'m| am)\s+going\s+to\b"
+    r"|next(?:\s+up)?\s*[:,]?\s*i(?:'ll| will| am|'m)?\b"
+    r"|next\s+up\b"
+    r"|let\s+me\s+(?:now\s+)?(?:fix|write|implement|build|do|start|post|draft|run|take|pick)"
+    r"|about\s+to\s+(?:fix|write|implement|build|start|post|do)"
+    r"|one\s+small\s+phase"
+    r"|i(?:'ll| will)\s+write\s+the\s+(?:next\s+)?(?:work[- ]?order|order)"
+    r"|i(?:'ll| will)\s+post\s+the\s+(?:next\s+)?(?:work[- ]?order|order)"
+    r")", re.I)
+
+FILE_REF_RE = re.compile(r"(?<![\w/.])([A-Za-z0-9][\w.-]*\.(?:md|txt|json|ya?ml|patch|diff))", re.I)
+# a name that reads like something Claude wrote for the agent, not a repo file
+ATTACH_NAME_RE = re.compile(r"^[\w.-]*(?:prompt|brief|order|handoff)[\w.-]*\.(?:md|txt|json|patch|diff)$", re.I)
+
+ASK_FOOTER = ("(This is the work-order watcher checking in automatically. It asks at most once "
+              "per turn, it never reads prose as an order, and it ignores this message if it "
+              "is wrong.)")
+
+ORDER_TEMPLATE = """<<<WORK-ORDER
+id: {id}
+dir: {dir}
+branch: {branch}
+goal: {goal}
+acceptance: {acceptance}
+>>>"""
+
+
+def looks_like_work_promise(text: str) -> bool:
+    """Does this message read as work Claude is about to do itself?"""
+    return bool(PROMISE_RE.search(text or ""))
+
+
+def _norm_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+
+
+def find_downloaded(name: str, outdir: str = DOWNLOADS) -> str | None:
+    """The local copy of a file Claude named, tolerating " (1)" and renames."""
+    exact = os.path.join(outdir, name)
+    if os.path.isfile(exact):
+        return exact
+    want = _norm_name(name)
+    stem = _norm_name(re.sub(r"\.[A-Za-z0-9]{1,5}$", "", name))
+    ext = os.path.splitext(name)[1].lower()
+    try:
+        entries = sorted(os.listdir(outdir))
+    except OSError:
+        return None
+    for f in entries:
+        p = os.path.join(outdir, f)
+        if os.path.isfile(p) and _norm_name(f) == want:
+            return p
+    for f in entries:
+        p = os.path.join(outdir, f)
+        if (os.path.isfile(p) and len(stem) >= 6 and stem in _norm_name(f)
+                and (not ext or f.lower().endswith(ext))):
+            return p
+    return None
+
+
+def order_file_refs(order: dict, outdir: str = DOWNLOADS) -> list[str]:
+    """File names in an order that are worth chasing (Claude's own attachments)."""
+    names: list[str] = []
+    for m in FILE_REF_RE.finditer(order.get("raw") or ""):
+        name = m.group(1)
+        if name in names or "/" in name:
+            continue
+        if ATTACH_NAME_RE.match(name) or find_downloaded(name, outdir):
+            names.append(name)
+    return names
+
+
+def resolve_order_files(order: dict, files: list[dict],
+                        outdir: str = DOWNLOADS) -> tuple[list[dict], list[str]]:
+    """Attach every file the order names that exists; report the ones that do not.
+
+    The absolute path is what matters: if the download step failed, the order
+    still says exactly where to look, instead of the agent starting blind.
+    """
+    attached = list(files)
+    known = {f.get("path") for f in attached}
+    missing: list[str] = []
+    for name in order_file_refs(order, outdir):
+        found = find_downloaded(name, outdir)
+        if found:
+            if found not in known:
+                attached.append({"name": name, "path": found, "bytes": os.path.getsize(found)})
+                known.add(found)
+        else:
+            missing.append(os.path.join(outdir, name))
+    return attached, missing
+
+
+def route_orders(st: dict, orders: list[dict]) -> dict:
+    """Split extracted orders into what the watcher should do with each.
+
+    * dispatch   - new, complete, never run
+    * incomplete - told us to do something, but not where or how it is done
+    * duplicate  - an id that already ran, re-posted with different text
+    * ignored    - byte-identical re-post of something already handled
+    """
+    out: dict[str, list] = {"dispatch": [], "incomplete": [], "duplicate": [], "ignored": []}
+    seen = st.get("orders") or {}
+    sessions = st.get("sessions") or {}
+    starts = st.get("starts") or {}
+    if isinstance(seen, list):                     # tolerate an older state file
+        seen = {k: "" for k in seen}
+    for o in orders:
+        if seen.get(o["id"]) == _hash(o["raw"]):
+            out["ignored"].append(o)
+            continue
+        problems = order_problems(o)
+        if problems:
+            out["incomplete"].append((o, problems))
+            continue
+        rec = starts.get(o["id"]) or {}
+        ran = bool(sessions.get(o["id"]) or rec.get("session")
+                   or rec.get("status") in ("started", "dry_run"))
+        out["duplicate" if ran else "dispatch"].append(o)
+    return out
+
+
+def agent_busy(cfg: dict, st: dict, now: float | None = None) -> dict:
+    """Best effort: is the most recently started agent still working?
+
+    ``outcome`` cannot be trusted for this - a busy agent can read as
+    "interrupted" - so we look at when its transcript last moved.  Fail-open: if
+    the API cannot be read we say "not busy" rather than stall the loop.
+    """
+    sessions = st.get("sessions") or {}
+    if not sessions:
+        return {}
+    starts = st.get("starts") or {}
+    oid = max(sessions, key=lambda k: (starts.get(k) or {}).get("updated") or 0)
+    sid = sessions[oid]
+    w = cfg.get("watch", {})
+    binp = os.path.expanduser(w.get("opencode_bin") or "~/.opencode/bin/opencode")
+    try:
+        rows = oc_api(binp, "GET", "/api/session/%s/message" % sid, timeout=30)
+    except Exception as e:
+        log("  could not check whether %s is still working: %s" % (oid, e))
+        return {}
+    rows = rows.get("data") if isinstance(rows, dict) else rows
+    if isinstance(rows, dict):
+        rows = rows.get("messages") or []
+    last = 0.0
+    for r in rows or []:
+        t = (r.get("time") or {}) if isinstance(r, dict) else {}
+        for key in ("completed", "streamed", "created"):
+            v = t.get(key)
+            if isinstance(v, (int, float)):
+                last = max(last, v / 1000.0)
+                break
+    if not last:
+        return {}
+    if (now or time.time()) - last < float(w.get("agent_active_seconds", 1800)):
+        return {"order": oid, "session": sid, "last_activity": last}
+    return {}
+
+
+def attention_needed(routed: dict, text: str) -> bool:
+    """Would this message need an ask at all?  Deliberately cheap: no API calls,
+    so the watcher only checks whether an agent is busy when it has to."""
+    if routed.get("dispatch") or routed.get("ignored"):
+        return False
+    return bool(routed.get("incomplete") or routed.get("duplicate")
+                or looks_like_work_promise(text))
+
+
+def plan_attention(st: dict, text: str, routed: dict, busy: dict, cfg: dict) -> dict:
+    """Decide what Claude's newest message needs - nothing, an ask, or the loud flag.
+
+    Pure apart from the ``nudge`` record in ``st``: it is re-run every pass while
+    the same message stays newest, so it must not consume anything unless it is
+    really going to send.  ``nudge.streak`` counts the asks since the last order
+    was dispatched, which is what bounds this to one message per turn.
+    """
+    watch = cfg.get("watch", {})
+    if not watch.get("ask_for_order", True):
+        return {"action": "off", "why": "ask_for_order is off"}
+    if not attention_needed(routed, text):
+        return {"action": "none", "why": "the newest message needs nothing"}
+    if busy:
+        return {"action": "wait", "why": "%s is still working" % busy.get("order")}
+    has_incomplete = bool(routed.get("incomplete"))
+    has_duplicate = bool(routed.get("duplicate"))
+    kind = "incomplete" if has_incomplete else ("duplicate" if has_duplicate else "stall")
+    nudge = st.setdefault("nudge", {"streak": 0})
+    streak = int(nudge.get("streak") or 0)
+    since = time.time() - float(nudge.get("at") or 0)
+    max_streak = int(watch.get("ask_max_streak", 1))
+    if streak >= max_streak:
+        if since < float(watch.get("ask_grace_seconds", 600)):
+            return {"action": "wait", "kind": kind,
+                    "why": "asked %d min ago, giving Claude time" % max(1, int(since / 60))}
+        return {"action": "needs_order", "kind": kind,
+                "why": "asked %d time(s) and no order followed" % streak}
+    if since < float(watch.get("ask_min_seconds", 120)):
+        return {"action": "wait", "kind": kind, "why": "asked %d s ago" % int(since)}
+    return {"action": "ask", "kind": kind, "why": "no dispatchable order in the message"}
+
+
+def build_ask(plan: dict, routed: dict, text: str) -> str:
+    """The one message we send back: the exact template, and only what is missing."""
+    kind = plan.get("kind")
+    if kind == "incomplete":
+        order, problems = (routed.get("incomplete") or [({}, [])])[0]
+        return (
+            "WATCHER: your %s block is not dispatchable yet - missing: %s. Nothing was started: "
+            "an agent with no dir, or no acceptance test, burns a whole turn guessing. If the "
+            "work is real, re-post the order complete, same id, with the missing lines:\n\n%s\n\n"
+            "If you wrote an agent prompt file, attach it as a file card as well - and put its "
+            "absolute path inside the goal as a fallback.\n%s"
+            % (order.get("id") or "work order", ", ".join(problems),
+               ORDER_TEMPLATE.format(id=order.get("id") or "WO-<next free>",
+                                     dir=order.get("dir") or "/absolute/path/to/repo",
+                                     branch=order.get("branch") or "branch",
+                                     goal=order.get("goal") or "what to build",
+                                     acceptance=order.get("acceptance") or "how we know it is done"),
+               ASK_FOOTER))
+    if kind == "duplicate":
+        order = (routed.get("duplicate") or [{}])[0]
+        return (
+            "WATCHER: %s already ran and the text you just posted differs from the order it was "
+            "given, so nothing was started - one id is one agent, and a second one is how two "
+            "agents end up in the same repo. If this is new work, post it under the next free id; "
+            "if you were quoting the old order, ignore this message.\n%s"
+            % (order.get("id") or "that order", ASK_FOOTER))
+    snippet = " ".join((text or "").split())[-240:]
+    return (
+        "WATCHER: your last message reads as work you are about to do - \"%s\" - but it carries no "
+        "WORK-ORDER block, so nothing was dispatched and no agent has started. If that work is "
+        "real, post it now as:\n\n%s\n\n"
+        "If you were only summarising, ignore this message.\n%s"
+        % (snippet,
+           ORDER_TEMPLATE.format(id="WO-<next free>", dir="/absolute/path/to/repo", branch="branch",
+                                 goal="what to build", acceptance="how we know it is done"),
+           ASK_FOOTER))
+
+
+def send_ask(st: dict, b: Bridge, text: str, timeout: float = 300.0) -> str:
+    """Send one automatic ask and remember that we did.
+
+    The bookkeeping happens whether or not Claude can answer: if the window is
+    down the message is queued and delivered later, which still counts as asked.
+    """
+    nudge = st.setdefault("nudge", {"streak": 0})
+    nudge["streak"] = int(nudge.get("streak") or 0) + 1
+    nudge["at"] = time.time()
+    nudge["text"] = text[:200]
+    try:
+        b.ask(text, timeout=timeout)
+        return "sent"
+    except ClaudeUnavailable as e:
+        if e.sent:
+            return "sent (Claude reads it when the limit lifts)"
+        return "queued for delivery (%s)" % (e.queued or e.text)
+    except TimeoutError:
+        # the message is in the chat; its reply can finish on a later pass
+        return "sent, reply still coming"
+
+
+def clear_needs_order(st: dict) -> None:
+    st.pop("needs_order", None)
+    try:
+        os.remove(NEEDS_ORDER)
+    except OSError:
+        pass
+
+
+def write_needs_order(st: dict, why: str, detail: str, snippet: str = "") -> None:
+    """The loud part: a file next to the bridge, a log line, and a state flag."""
+    st["needs_order"] = {"why": why, "at": time.time(), "detail": detail[:600]}
+    lines = [
+        "# The work-order queue is stalled",
+        "",
+        "When : %s" % datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Why  : %s" % why,
+        "",
+        "What the watcher already asked Claude:",
+        "",
+        detail.strip(),
+        "",
+    ]
+    if snippet:
+        lines += ["Claude's newest message (tail):", "```",
+                  " ".join((snippet or "").split())[-600:], "```", ""]
+    lines += [
+        "No agent is running for this turn. The watcher asks once per turn and will not",
+        "ask again, so this one is on a human: get Claude to post a complete WORK-ORDER",
+        "block (ask-claude \"...\") or start the work yourself.",
+        "",
+        "This file is deleted the moment an order is dispatched.",
+    ]
+    with open(NEEDS_ORDER, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    log("NEEDS ORDER - %s - see %s" % (why, NEEDS_ORDER))
+
+
 def order_to_inbox(order: dict, files: list[dict]) -> str:
     os.makedirs(INBOX, exist_ok=True)
     body = ["# Work order %s" % order["id"], ""]
@@ -166,6 +493,12 @@ def order_to_inbox(order: dict, files: list[dict]) -> str:
         body += ["## Files from Claude"]
         for f in files:
             body.append("- %s (%s bytes)" % (f["path"], f["bytes"]))
+        body.append("")
+    if order.get("missing_files"):
+        body += ["## Files Claude named but the bridge could not download",
+                 "Read them from these paths if they exist (and check the repository):"]
+        for p in order["missing_files"]:
+            body.append("- %s" % p)
         body.append("")
     body += ["## Work order exactly as Claude wrote it", "```", order["raw"], "```", ""]
     path = os.path.join(INBOX, "%s.md" % order["id"])
@@ -189,6 +522,13 @@ def build_prompt(order: dict, files: list[dict], inbox_path: str) -> str:
         lines.append("Claude attached these files (already downloaded for you):")
         for f in files:
             lines.append("  - %s" % f["path"])
+        lines.append("")
+    if order.get("missing_files"):
+        lines.append("Claude's order names files the bridge could NOT download. Read them from")
+        lines.append("these exact paths if they exist, and look in the repository too - do not")
+        lines.append("start work without them:")
+        for p in order["missing_files"]:
+            lines.append("  - %s" % p)
         lines.append("")
     lines += [
         "When Claude says to save a file in a particular directory or at a particular path, do exactly that:",
@@ -441,12 +781,22 @@ def handle_orders(cfg: dict, st: dict, orders: list[dict], files: list[dict] | N
         seen = {k: "" for k in seen}
 
     for o in orders:
+        problems = order_problems(o)
+        if problems:
+            # belt and braces: route_orders already filters these out, but no path
+            # may ever start an agent on half a brief
+            log("  refusing %s - not dispatchable (missing %s)" % (o["id"], ", ".join(problems)))
+            continue
         inbox_path = order_to_inbox(o, files)
         log("new work order %s -> %s" % (o["id"], inbox_path))
         seen[o["id"]] = _hash(o["raw"])
         st["orders"] = seen
         rec = st.setdefault("starts", {}).setdefault(o["id"], {"status": "pending", "attempts": 0})
         rec.update({"order": o, "inbox": inbox_path, "files": files, "updated": time.time()})
+        # a dispatched order is progress: the turn is alive again, so any ask
+        # streak or stall flag left over from the previous turn is finished with
+        st["nudge"] = {"streak": 0, "at": 0}
+        clear_needs_order(st)
         if dry_run:
             rec["status"] = "dry_run"
         save_state(st)
@@ -525,10 +875,8 @@ def pass_once(cfg: dict, st: dict, dry_run: bool = False) -> dict:
     orders: list[dict] = []
     for m in msgs:
         orders.extend(extract_work_orders(m))
-    seen = st.get("orders") or {}
-    if isinstance(seen, list):  # tolerate an older state file
-        seen = {k: "" for k in seen}
-    new = [o for o in orders if seen.get(o["id"]) != _hash(o["raw"])]
+    routed = route_orders(st, orders)
+    new = routed["dispatch"]
 
     files: list[dict] = []
     if new:
@@ -536,8 +884,44 @@ def pass_once(cfg: dict, st: dict, dry_run: bool = False) -> dict:
             files = download_new_files(b, st)
         except Exception as e:
             log("file download skipped: %s" % e)
+        # Hand every file the order names over by absolute path, even when the
+        # card download failed: a pointer the agent cannot follow is no pointer.
+        for o in new:
+            files, missing = resolve_order_files(o, files)
+            if missing:
+                try:
+                    files, missing = resolve_order_files(
+                        o, files + b.download([os.path.basename(p) for p in missing],
+                                              timeout=60.0))
+                except Exception as e:
+                    log("  could not fetch %s: %s"
+                        % (", ".join(os.path.basename(p) for p in missing), e))
+            o["missing_files"] = missing
+            for p in missing:
+                log("  %s names %s but it is not on disk - handing the path to the agent"
+                    % (o["id"], os.path.basename(p)))
 
     handle_orders(cfg, st, new, files, dry_run=dry_run)
+
+    # What Claude's newest message needs, if anything: an incomplete order, a
+    # re-post of one that already ran, or a promise with no order behind it.
+    # Dry runs never message Claude.
+    if not dry_run:
+        newest = route_orders(st, extract_work_orders(text))
+        busy = agent_busy(cfg, st) if attention_needed(newest, text) else {}
+        plan = plan_attention(st, text, newest, busy, cfg)
+        if plan["action"] == "ask" and st.get("claude_up", True):
+            ask = build_ask(plan, newest, text)
+            log("asking Claude for the %s order: %s" % (plan["kind"], plan["why"]))
+            log("  the ask: %s" % " ".join(ask.split())[:200])
+            log("  result : %s"
+                % send_ask(st, b, ask, timeout=float(cfg.get("watch", {}).get("ask_timeout", 180))))
+        elif plan["action"] == "needs_order":
+            write_needs_order(st, plan["why"], build_ask(plan, newest, text), text)
+        elif plan["action"] == "ask":
+            quiet(st, "Claude cannot answer right now - holding the ask")
+        elif plan["action"] in ("wait", "off"):
+            quiet(st, plan["why"])
     st["last_seen"] = text[:400]
     st["updated"] = time.time()
     return st

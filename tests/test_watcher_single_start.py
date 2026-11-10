@@ -57,6 +57,7 @@ def fake_start(cfg, order, files, inbox_path):
     return "ses_" + order["id"]
 
 watcher.start_agent = fake_start
+watcher.open_agent_terminal = lambda cfg_, oid, sid, directory: False
 cfg = {"watch": {"auto_start": True, "start_retries": 2, "start_retry_delay": 0}}
 order = json.loads(os.environ["CB_ORDER"])
 
@@ -81,6 +82,8 @@ def tmp_env() -> str:
     watcher.LOG = os.path.join(d, "watcher.log")
     watcher.LOCK = os.path.join(d, "watcher.lock")
     os.makedirs(watcher.INBOX, exist_ok=True)
+    # a test must never open a real terminal window on the user's desktop
+    watcher.open_agent_terminal = lambda cfg_, oid, sid, directory: False
     return d
 
 

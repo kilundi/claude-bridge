@@ -532,33 +532,105 @@ JS_CLICK_FILE_DOWNLOAD = r"""
 
 WORK_ORDER_OPEN = re.compile(r"<<<\s*WORK[-_ ]?ORDER\s*", re.I)
 WORK_ORDER_FENCE = re.compile(r"```+[ \t]*work[-_ ]?order[ \t]*\n(.*?)(?:```+|$)", re.I | re.S)
+# one "key: value" line of an order; tolerates "- key:", "1. key:" and "# key:"
+ORDER_FIELD_LINE = re.compile(
+    r"^[ \t]*(?:[-*][ \t]*|\d+[.)][ \t]*)?(?:#+[ \t]*)?([A-Za-z][A-Za-z _-]{0,24}?)[ \t]*[:=][ \t]*(.*)$")
+ORDER_ID_VALUE = re.compile(r"^WO-\d+$", re.I)
+LOOSE_MIN_FIELDS = 3
+
+# What an order must carry before it is worth handing to an agent.  Everything
+# else is a convenience; these three are the difference between a brief and a
+# guess.  ``order_problems`` is what lets the watcher ask for the missing lines
+# instead of starting an agent on half an order.
+REQUIRED_ORDER_FIELDS = ("dir", "goal", "acceptance")
 
 
-def _work_order_blocks(text: str) -> list[str]:
-    """Return the raw body of every work-order block in text.
+def _field_key(name: str) -> str:
+    return (name or "").strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def _goal_of(fields: dict) -> str:
+    return (fields.get("goal") or fields.get("task") or fields.get("title")
+            or fields.get("objective") or "").strip()
+
+
+def _wrapped_blocks(text: str) -> list[tuple[int, int, str]]:
+    """``(start, end, body)`` for every <<<WORK-ORDER ...>>> / ```work-order block.
 
     Claude sometimes drops the closing >>> of the angle-bracket form, so when
     there is no closing marker the block ends at a blank line or at the end of
     the message.
     """
-    blocks: list[str] = []
+    out: list[tuple[int, int, str]] = []
     for m in WORK_ORDER_OPEN.finditer(text):
         start = m.end()
-        end = text.find(">>>", start)
-        if end == -1:
+        close = text.find(">>>", start)
+        if close == -1:
             rest = text[start:]
-            stop = re.search(r"\n\s*\n", rest)
-            blocks.append(rest[: stop.start()] if stop else rest)
+            stop = re.search(r"\n[ \t]*\n", rest)
+            end = start + (stop.start() if stop else len(rest))
+            body = text[start:end]
         else:
-            blocks.append(text[start:end])
-    blocks.extend(m.group(1) for m in WORK_ORDER_FENCE.finditer(text))
+            end = close
+            body = text[start:close]
+        out.append((m.start(), end, body))
+    for m in WORK_ORDER_FENCE.finditer(text):
+        out.append((m.start(), m.end(), m.group(1)))
+    return out
+
+
+def _loose_blocks(text: str, taken: list[tuple[int, int]] | None = None) -> list[str]:
+    """Field lists typed with no wrapper at all.
+
+    The wrapped forms are the protocol, but the same instruction often arrives
+    as a plain list of the same fields.  Only a *run* of at least three field
+    lines that starts at the id, names a ``WO-<n>`` id and carries a goal counts
+    - so prose that merely mentions one of these words is not read as an order.
+    """
+    taken = taken or []
+    lines = text.splitlines()
+    offs: list[int] = []
+    acc = 0
+    for ln in lines:
+        offs.append(acc)
+        acc += len(ln) + 1
+    blocks: list[str] = []
+    run: list[int] = []
+
+    def flush() -> None:
+        if len(run) >= LOOSE_MIN_FIELDS:
+            start, end = offs[run[0]], offs[run[-1]] + len(lines[run[-1]])
+            first = ORDER_FIELD_LINE.match(lines[run[0]])
+            fields = {_field_key(ORDER_FIELD_LINE.match(lines[i]).group(1)):
+                      ORDER_FIELD_LINE.match(lines[i]).group(2).strip() for i in run}
+            wid = (fields.get("id") or fields.get("work_order") or "").strip()
+            overlapped = any(s < end and start < e for s, e in taken)
+            if (not overlapped and _field_key(first.group(1)) in ("id", "work_order")
+                    and ORDER_ID_VALUE.match(wid) and _goal_of(fields)):
+                blocks.append("\n".join(lines[i] for i in run))
+        run.clear()
+
+    for i, ln in enumerate(lines):
+        m = ORDER_FIELD_LINE.match(ln)
+        if m and m.group(2).strip():
+            run.append(i)
+        else:
+            flush()
+    flush()
     return blocks
+
+
+def _work_order_blocks(text: str) -> list[str]:
+    """Every work-order body in ``text``, wrapped or bare."""
+    wrapped = _wrapped_blocks(text)
+    return ([body for _, _, body in wrapped]
+            + _loose_blocks(text, [(s, e) for s, e, _ in wrapped]))
 
 
 def extract_work_orders(text: str) -> list[dict]:
     """Pull work orders out of a Claude message.
 
-    Accepted shapes - both are what the protocol message asks Claude to use:
+    Accepted shapes - the first two are what the protocol asks Claude to use:
 
         <<<WORK-ORDER
         id: WO-1
@@ -569,7 +641,13 @@ def extract_work_orders(text: str) -> list[dict]:
         >>>
 
     or a fenced block whose info string is ``work-order``. The closing marker is
-    optional: without it the block ends at a blank line.
+    optional: without it the block ends at a blank line.  A bare field list with
+    no wrapper is accepted too (see ``_loose_blocks``) - the same instruction in
+    different clothes should not cost a turn.
+
+    Extraction is deliberately *not* validation: an order missing its dir or its
+    acceptance test is still returned, so the watcher can say what is missing
+    instead of dropping it.  See ``order_problems``.
     """
     if not text:
         return []
@@ -578,15 +656,11 @@ def extract_work_orders(text: str) -> list[dict]:
     for raw in _work_order_blocks(text):
         fields: dict[str, str] = {}
         for line in raw.splitlines():
-            line = line.strip().lstrip("-*#").strip()
-            if not line or ":" not in line:
+            m = ORDER_FIELD_LINE.match(line)
+            if not m or not m.group(2).strip():
                 continue
-            k, _, v = line.partition(":")
-            fields[k.strip().lower().replace(" ", "_").replace("-", "_")] = v.strip()
-        goal = (
-            fields.get("goal") or fields.get("task") or fields.get("title")
-            or fields.get("objective") or ""
-        )
+            fields[_field_key(m.group(1))] = m.group(2).strip()
+        goal = _goal_of(fields)
         if not goal:
             continue
         wid = fields.get("id") or fields.get("work_order") or ""
@@ -606,6 +680,27 @@ def extract_work_orders(text: str) -> list[dict]:
             "raw": raw.strip(),
         })
     return orders
+
+
+def order_problems(order: dict) -> list[str]:
+    """What is missing before this order can be handed to an agent.
+
+    Returns [] for a complete order.  This is the watcher's guarantee that a
+    half-written order never becomes a half-informed agent: whatever is listed
+    here is asked back from Claude, once.
+    """
+    problems: list[str] = []
+    for name in REQUIRED_ORDER_FIELDS:
+        if not (order.get(name) or "").strip():
+            problems.append(name)
+    where = (order.get("dir") or "").strip()
+    if where:
+        where = os.path.expanduser(where)
+        if not os.path.isabs(where):
+            problems.append("dir (must be an absolute path)")
+        elif not os.path.isdir(where):
+            problems.append("dir (does not exist: %s)" % where)
+    return problems
 
 
 class CDP:
@@ -1258,11 +1353,15 @@ def main(argv=None):
                 st = b.last_message(c)
                 orders = extract_work_orders(st.get("last", ""))
                 if args.json:
-                    print(json.dumps({"orders": orders, "streaming": st.get("streaming")}, indent=1))
+                    out_orders = [dict(o, problems=order_problems(o)) for o in orders]
+                    print(json.dumps({"orders": out_orders, "streaming": st.get("streaming")}, indent=1))
                 else:
                     if orders:
                         for o in orders:
                             print(f"[{o['id']}] {o['goal']}  dir={o['dir'] or '-'} branch={o['branch'] or '-'}")
+                            missing = order_problems(o)
+                            if missing:
+                                print("  ! not dispatchable - missing: %s" % ", ".join(missing))
                     else:
                         print("(no work order in Claude's last message)")
                 return 0

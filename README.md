@@ -273,6 +273,51 @@ or a fenced ```` ```work-order ```` block. Fields:
 | `save` | optional path the result must be written to |
 | `model` | optional `provider/id` override for that one job |
 
+### A half-written order is asked back, never guessed at
+
+The protocol is a template, not a memory test — a long chat gets summarised by the web
+UI and things get forgotten. So the queue does not depend on Claude remembering:
+
+* **A bare list of the same fields counts.** The `<<<WORK-ORDER ...>>>` wrapper is a
+  convenience; a plain run of `id:` / `dir:` / `goal:` lines is read as an order too.
+* **An order must carry `dir`, `goal` and `acceptance`.** Anything else is not dispatched.
+  An agent with no directory, or no way to know it is finished, burns a whole turn
+  guessing — so the watcher asks for exactly the missing lines instead, once, quoting the
+  template back with the fields that *are* there.
+* **A promise with no order behind it is not ignored.** If Claude's newest message reads
+  as work it is about to do (`"I'm fixing the eleven findings in one small phase"`) and
+  carries no order, the watcher sends one short message naming the template. Past-tense
+  reports ("I've fixed …") and ordinary summaries never trigger this.
+* **One id is one agent.** An id that already ran, re-posted with *different* text, is not
+  started again — the watcher asks whether it is a new order (new id) or a quote.
+* **Naming a file is enough.** If the order names `agent-prompt-*.md` and the card download
+  failed, the file is resolved in `~/claude-bridge/downloads/` (tolerating a `" (1)"` copy)
+  and handed to the agent by absolute path; if it really is not there, the order says so
+  instead of the agent starting blind.
+
+Each of those asks is sent **at most once per turn** (a turn ends when an order is
+dispatched). If it still does not produce an order, the watcher stops asking and makes it
+loud instead:
+
+```bash
+~/claude-bridge/watcher.sh status      # prints STALLED if a turn needs an order
+cat ~/claude-bridge/NEEDS-ORDER.md     # what was asked, what Claude said, what to do
+```
+
+`NEEDS-ORDER.md` is written next to the bridge and deleted the moment an order is
+dispatched. It is a human's cue, not another automated message: no agent is running while
+it exists, and nothing is sent to Claude a second time. Knobs, all under `watch` in
+`config.json`:
+
+| setting | default | meaning |
+|---------|---------|---------|
+| `ask_for_order` | `true` | set `false` to never message Claude about a missing/half order (the loud flag still appears) |
+| `ask_max_streak` | `1` | how many times to ask before going loud |
+| `ask_grace_seconds` | `600` | how long to give Claude to answer the ask before going loud |
+| `ask_min_seconds` | `120` | never two asks closer together than this |
+| `ask_timeout` | `180` | how long the watcher waits for the reply to its ask (the reply is read on a later pass anyway) |
+| `agent_active_seconds` | `1800` | an agent counts as "still working" if its transcript moved within this window; while one is working the watcher holds its ask rather than stack a second agent on the same repo |
+
 ### Files, and "save this to that directory"
 
 Claude usually hands over *files* ("Agent prompt ...") rather than pasting text. The

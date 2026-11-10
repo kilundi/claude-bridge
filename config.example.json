@@ -8,7 +8,16 @@
     "compact_on_resume": true,
     "launch_terminal": true,
     "default_dir": "~/projects",
-    "model": { "providerID": "your-provider", "id": "your-model" },
-    "opencode_bin": "~/.opencode/bin/opencode"
+    "model": {
+      "providerID": "your-provider",
+      "id": "your-model"
+    },
+    "opencode_bin": "~/.opencode/bin/opencode",
+    "ask_for_order": true,
+    "ask_max_streak": 1,
+    "ask_grace_seconds": 600,
+    "ask_min_seconds": 120,
+    "ask_timeout": 180,
+    "agent_active_seconds": 1800
   }
 }
