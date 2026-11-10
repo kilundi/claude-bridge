@@ -72,9 +72,11 @@ From a shell:
 ```bash
 ask-claude "DONE: parser fixed and pushed to feature/parser-fix. Tests green. What is the next move?"
 ask-claude --read      # print Claude's last message, send nothing
-ask-claude --status    # is the window up / signed in / streaming?
+ask-claude --status    # is the window up / signed in / streaming? (and which tab we drive)
 ask-claude --open      # make sure the bridge window is running
 ask-claude --probe     # DOM hints, for debugging selectors
+ask-claude --new-chat  # start a fresh chat and make it the one we use (see below)
+ask-claude --save-chat # remember the chat that is open in the bridge window
 ```
 
 From an agent (opencode), the `claude-bridge` MCP server exposes a native tool:
@@ -339,6 +341,51 @@ simply not in the list.
 
 ---
 
+## Starting a new chat
+
+A long thread fills up, so you want to continue in a fresh chat. The chat the
+bridge talks to is whatever `config.json` says in `chat_url`, and by default a
+fresh chat's address is not settled: `https://claude.ai/new` only becomes
+`/chat/<id>` once the first message has been sent. That is why starting one by
+hand used to fight you:
+
+- opening a new chat in the bridge window and running any bridge command would
+  navigate that tab **back** to the saved chat, so `--save-chat` saved the old
+  chat again;
+- and if several claude.ai tabs were open (a restored window, the launcher adding
+  one), the bridge picked one at random, so a message could land in the wrong chat.
+
+One command now does the whole switch, on the tab the bridge already drives:
+
+```bash
+ask-claude --new-chat                              # fresh chat, becomes the one we use
+ask-claude --new-chat "context: <handoff summary>"  # fresh chat, seeded with your context
+```
+
+`--new-chat` opens a fresh chat in the bridge window, makes it the chat we use
+and prints it. A new Claude has no memory of the old thread, so give it the
+handoff summary as the message (or paste it yourself and re-run `--save-chat`).
+`--save-chat` alone still means "remember the chat that is open in the bridge
+window" - it reads the tab as it is and never navigates it.
+
+Details worth knowing:
+
+- **The driven tab is remembered** (`bridge-target.json`, git-ignored). Extra
+  claude.ai tabs are left alone and cannot capture your messages; if that tab is
+  closed, the bridge falls back to the tab showing the saved chat.
+- **`--status` shows it**: `url`, the `target` it drives, and the `tabs` it can see.
+- **The queue carries over.** `state.json` keeps the orders this machine has
+  already handled, so nothing re-dispatches just because the chat changed. An
+  order is skipped only when its `id` **and** its text are byte-identical to one
+  already seen - so if Claude in the new chat re-uses an id like `WO-101` with
+  different text, it is still picked up.
+- **The standing plan still applies.** With `watch.compact_on_resume: true`, the
+  compact step runs when the limit lifts; see the section below.
+- **Cheaper than it sounds**: starting the chat costs no Claude message if you
+  send nothing.
+
+---
+
 ## Long conversations and `/compact`
 
 The user's habit for long threads is to run **`/compact`** on Claude so the
@@ -366,7 +413,7 @@ How the bridge handles it:
   ask-claude "Please write a compact handoff summary of this thread (goals, decisions, current state, next steps) so it can continue in a new chat."
   ```
 
-  then open a new chat, paste it, and `ask-claude --save-chat`.
+  then carry it into a fresh chat with `ask-claude --new-chat "<the summary>"`.
 
 ---
 
@@ -383,6 +430,7 @@ How the bridge handles it:
 | `start-bridge-chrome.sh` | launches/reuses the dedicated bridge Chrome window |
 | `bridge-up.sh` | after a restart: bridge window + sign-in check + watcher, in one go |
 | `config.json` | remembered `chat_url` + the `watch` settings |
+| `bridge-target.json` | the claude.ai tab the bridge drives (so extra tabs cannot steal a message) |
 | `inbox/` | work orders Claude has handed over (`<id>.md`) |
 | `downloads/` | file cards fetched from the chat |
 | `state.json` | which orders and files have been handled (watcher) |

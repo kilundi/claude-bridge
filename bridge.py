@@ -48,6 +48,7 @@ DEFAULT_TIMEOUT = float(os.environ.get("CLAUDE_BRIDGE_TIMEOUT", "600"))
 LAUNCHER = os.path.join(HERE, "start-bridge-chrome.sh")
 UP_SCRIPT = os.path.join(HERE, "bridge-up.sh")
 CONFIG_PATH = os.path.join(HERE, "config.json")
+TARGET_PATH = os.path.join(HERE, "bridge-target.json")
 
 # The web UI has no /compact (its slash menu only lists skills), so "compact" is
 # the documented equivalent: ask Claude for a short handoff a fresh chat can pick up.
@@ -171,12 +172,43 @@ def save_config(cfg: dict) -> None:
     os.replace(tmp, CONFIG_PATH)
 
 
+def load_target() -> str:
+    """The CDP id of the tab the bridge drives (so extra tabs cannot confuse it)."""
+    try:
+        with open(TARGET_PATH) as f:
+            return json.load(f).get("target") or ""
+    except Exception:
+        return ""
+
+
+def save_target(target_id: str) -> None:
+    try:
+        tmp = TARGET_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"target": target_id, "saved": time.time()}, f, indent=2)
+        os.replace(tmp, TARGET_PATH)
+    except Exception:
+        pass  # remembering the tab is an optimisation, never a failure
+
+
 def target_url() -> str:
     return (
         os.environ.get("CLAUDE_BRIDGE_URL")
         or load_config().get("chat_url")
-        or "https://claude.ai/new"
+        or NEW_CHAT_URL
     )
+
+
+NEW_CHAT_URL = "https://claude.ai/new"
+
+
+def is_new_chat_url(url: str) -> bool:
+    """True for claude.ai/new - a chat that has no id yet.
+
+    The url of a fresh chat only becomes stable (``/chat/<id>``) once a message has been
+    sent, so a saved ``/new`` means "the chat that is open", not "make a new one".
+    """
+    return url.split("#")[0].rstrip("/").endswith("/new")
 
 
 DEFAULT_URL = target_url()
@@ -651,7 +683,7 @@ class Bridge:
                 return last
         return last
 
-    def connect(self, want_composer: bool = True) -> CDP:
+    def connect(self, want_composer: bool = True, navigate: bool = True) -> CDP:
         if not ensure_chrome(self.page_url):
             raise RuntimeError(
                 f"bridge Chrome is not reachable on {BASE}. "
@@ -660,22 +692,40 @@ class Bridge:
         want = self.page_url.split("#")[0].rstrip("/")
         pages = self._pages()
 
+        # The tab we drive. With more than one claude.ai tab open (a restored window,
+        # the launcher adding one) picking pages[0] at random is how a message ends up
+        # in the wrong chat, so remember the id and prefer it.
+        pinned = [t for t in pages if t.get("id") and t.get("id") == load_target()]
         exact = [t for t in pages if (t.get("url") or "").split("#")[0].rstrip("/") == want]
-        if exact:
-            c = CDP(exact[0]["webSocketDebuggerUrl"])
-            self._wait_page(c, want_composer=want_composer)
-            return c
 
-        if pages:  # reuse a claude.ai tab, but always aim it at the saved chat
-            c = CDP(pages[0]["webSocketDebuggerUrl"])
-            c.call("Page.navigate", {"url": self.page_url})
-            self._wait_page(c, want_composer=want_composer, timeout=60.0)
+        if not navigate:  # --save-chat / --new-chat: the driven tab, exactly as it is
+            page = (pinned or pages or [None])[0]
+            if page is not None:
+                c = CDP(page["webSocketDebuggerUrl"])
+                save_target(page.get("id") or "")
+                self._wait_page(c, want_composer=want_composer)
+                return c
+
+        if pages:  # drive the remembered tab, aiming it at the saved chat
+            page = (pinned or exact or pages)[0]
+            c = CDP(page["webSocketDebuggerUrl"])
+            save_target(page.get("id") or "")
+            on_it = (page.get("url") or "").split("#")[0].rstrip("/") == want
+            if on_it or is_new_chat_url(want):
+                # nothing to do: it is the saved chat already, or the saved chat is
+                # "a new chat", whose real url only appears once a message is sent -
+                # aiming a page at /new would start a *different* empty chat.
+                self._wait_page(c, want_composer=want_composer)
+            else:
+                c.call("Page.navigate", {"url": self.page_url})
+                self._wait_page(c, want_composer=want_composer, timeout=60.0)
             return c
 
         page = create_page(self.page_url)
         if not page or not page.get("webSocketDebuggerUrl"):
             raise RuntimeError("could not open a claude.ai page")
         c = CDP(page["webSocketDebuggerUrl"])
+        save_target(page.get("id") or "")
         self._wait_page(c, want_composer=want_composer, timeout=60.0)
         return c
 
@@ -1063,6 +1113,9 @@ def main(argv=None):
     ap.add_argument("--download", metavar="MATCH", nargs="?", const="", default=None,
                     help="download Claude's file card(s); optional MATCH on the title")
     ap.add_argument("--save-chat", action="store_true", help="remember the claude.ai chat currently open in the bridge window")
+    ap.add_argument("--new-chat", action="store_true",
+                    help="open a fresh chat in the bridge window and make it the chat we use "
+                         "(add a message to seed it, e.g. a handoff summary)")
     ap.add_argument("--url", default=None, help="page url to open/create")
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     ap.add_argument("--json", action="store_true", help="machine-readable output")
@@ -1130,7 +1183,9 @@ def main(argv=None):
                     print("  stopped: %s" % res["stopped"])
             return 0 if not res["remaining"] else 3
 
-        c = b.connect()
+        # --save-chat and --new-chat have to see the page as it is: aiming it at the saved
+        # chat first is exactly what made "remember this new chat" impossible.
+        c = b.connect(navigate=not (args.save_chat or args.new_chat))
         try:
             if args.goto:
                 c.call("Page.navigate", {"url": args.goto})
@@ -1142,8 +1197,31 @@ def main(argv=None):
                     except Exception:
                         continue
                 time.sleep(0.4)
-                if not (args.probe or args.status or args.read or args.save_chat or args.compact or args.slash or args.message):
+                if not (args.probe or args.status or args.read or args.save_chat or args.new_chat or args.compact or args.slash or args.message):
                     args.status = True
+            if args.new_chat:
+                c.call("Page.navigate", {"url": NEW_CHAT_URL})
+                b._wait_page(c, want_composer=True, timeout=60.0)
+                text = " ".join(args.message).strip()
+                reply = b._ask_with(c, text, args.timeout) if text else None
+                st = b.state(c)
+                url = (st.get("url") or "").split("#")[0]
+                if "claude.ai" not in url:
+                    raise RuntimeError(f"the bridge page is not a claude.ai chat: {url}")
+                cfg = load_config()
+                cfg["chat_url"] = url
+                save_config(cfg)
+                if args.json:
+                    print(json.dumps({"new_chat": url, "seeded": bool(text), "reply": reply}))
+                else:
+                    print(f"new chat: {url}")
+                    if text:
+                        print("--- Claude opened the thread with ---")
+                        print(reply or "")
+                    else:
+                        print("say something (ask-claude \"...\"), then run "
+                              "ask-claude --save-chat to pin the chat's real id")
+                return 0
             if args.save_chat:
                 st = b.state(c)
                 url = (st.get("url") or "").split("#")[0]
@@ -1162,6 +1240,8 @@ def main(argv=None):
                 out = b.probe(c)
             elif args.status:
                 out = b.state(c)
+                out["target"] = load_target()
+                out["tabs"] = [t.get("url") for t in b._pages()]
             elif args.read:
                 st = b.last_message(c)
                 out = {"last": st.get("last", ""), "streaming": st.get("streaming"), "total": st.get("total")}
