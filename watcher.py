@@ -24,6 +24,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -44,6 +45,8 @@ LOCK = os.path.join(HERE, "watcher.lock")
 DOWNLOADS = os.path.join(HERE, "downloads")
 # written when a turn is stalled and Claude did not answer the one automatic ask
 NEEDS_ORDER = os.path.join(HERE, "NEEDS-ORDER.md")
+# where the opencode background server registers itself (pid, url, password)
+SERVICE_JSON = os.path.expanduser("~/.local/state/opencode/service.json")
 
 # how many times start_agent may be retried after the first failure, and how
 # long to wait between attempts (overridable from config.json watch settings)
@@ -300,42 +303,256 @@ def route_orders(st: dict, orders: list[dict]) -> dict:
     return out
 
 
+# --- the background server, and what survives it dying --------------------------------
+# Every agent's turn runs inside one process: the opencode background server. When it
+# dies - under memory pressure, on a restart, when the desktop session is torn down -
+# every in-flight turn dies with it, silently, and neither side of the loop notices.
+# These helpers are the watcher noticing, and doing what it can about it: keep the
+# server up, cap how many agents run at once (five of them on a 6 GB machine is what
+# killed it), resume the turns a restart interrupted, and close the windows left behind.
+
+
+def service_pid() -> int | None:
+    """The pid of the running opencode background server, or None if unreadable."""
+    try:
+        with open(SERVICE_JSON) as fh:
+            return int((json.load(fh) or {}).get("pid") or 0) or None
+    except Exception:
+        return None
+
+
+def note_service(st: dict, dry_run: bool = False) -> dict | None:
+    """Remember which server we saw; return {"from","to"} when the pid changed.
+
+    The pid is kept in state.json, so a restart is still noticed after the watcher
+    itself was restarted - or after the whole machine was.
+    """
+    pid = service_pid()
+    if not pid:
+        return None
+    prev = (st.get("service") or {}).get("pid")
+    if not dry_run:
+        rec = st.setdefault("service", {})
+        rec["pid"] = pid
+        rec["seen"] = time.time()
+    if prev and prev != pid:
+        return {"from": prev, "to": pid}
+    return None
+
+
+def _pid_alive(pid: int) -> bool:
+    """Is this pid a process that still exists?"""
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def ensure_service(cfg: dict, st: dict, dry_run: bool = False) -> bool:
+    """Start the opencode background server if it is gone.  At most once a minute.
+
+    Nothing owns that process: when it died at 03:53 the only reason it came back was
+    a stampede of clients each starting one, which is why it flapped twice.  One
+    starter is the fix, and it is the watcher.  A live server is never touched.
+    """
+    if dry_run:
+        return False
+    pid = service_pid()
+    if pid and _pid_alive(pid):
+        return False                           # alive - never interfere with it
+    w = cfg.get("watch") or {}
+    rec = st.setdefault("service", {})
+    if time.time() - float(rec.get("started") or 0) < float(w.get("service_start_cooldown", 60)):
+        return False
+    rec["started"] = time.time()
+    binp = os.path.expanduser(w.get("opencode_bin") or "~/.opencode/bin/opencode")
+    try:
+        p = subprocess.run([binp, "service", "start"], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=180)
+        log("  the opencode background server was gone - started it (pid %s): %s"
+            % (service_pid(), " ".join((p.stdout or p.stderr or "").split())[:160]))
+    except Exception as e:
+        log("  could not start the opencode background server: %s" % e)
+        return False
+    return True
+
+
+def _moved_at(binp: str, sid: str) -> float | None:
+    """When this session last moved, from its own record.
+
+    Deliberately not the transcript: a long session's message page is big enough that
+    the CLI's output is truncated mid-JSON (261 KB, unterminated string), which would
+    read as "unknown" exactly when an agent has the most work behind it.  The session
+    record is a few hundred bytes and carries ``time.updated``.
+    """
+    data = oc_api(binp, "GET", "/api/session/%s" % sid, timeout=30)
+    data = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(data, dict):
+        return None
+    t = data.get("time") or {}
+    for key in ("updated", "created"):
+        v = t.get(key)
+        if isinstance(v, (int, float)):
+            return v / 1000.0
+    return None
+
+
+def session_activity(cfg: dict, st: dict, now: float | None = None) -> list[dict]:
+    """When each agent last moved: [{"order","session","last","live"}].
+
+    ``outcome`` is not a liveness signal - a busy agent reads as "interrupted" - so
+    the session's own timestamps are what we count.  ``last`` is None when it cannot
+    be read: unknown, and never treated as idle.  Oldest start first.
+    """
+    now = now or time.time()
+    w = cfg.get("watch") or {}
+    binp = os.path.expanduser(w.get("opencode_bin") or "~/.opencode/bin/opencode")
+    window = float(w.get("agent_active_seconds", 1800))
+    starts = st.get("starts") or {}
+    out: list[dict] = []
+    for oid, sid in (st.get("sessions") or {}).items():
+        last: float | None = None
+        try:
+            last = _moved_at(binp, sid)
+        except Exception as e:
+            log("  could not read %s's session record: %s" % (oid, e))
+        out.append({"order": oid, "session": sid, "last": last,
+                    "live": bool(last and now - last < window)})
+    out.sort(key=lambda a: (starts.get(a["order"]) or {}).get("updated") or 0)
+    return out
+
+
+def live_agents(activity: list[dict]) -> list[dict]:
+    """The agents whose transcript moved inside ``agent_active_seconds``."""
+    return [a for a in activity if a.get("live")]
+
+
+def slot_agents(activity: list[dict], cfg: dict, now: float | None = None) -> list[dict]:
+    """The agents holding one of the ``max_agents`` slots.
+
+    A slot is held for ``slot_seconds`` (2 h by default), not just
+    ``agent_active_seconds``: a 48 minute end-to-end suite looks dead to any recency
+    check, and stacking a third agent on top of that is how the box ran out of memory
+    in the first place.
+    """
+    now = now or time.time()
+    window = float((cfg.get("watch") or {}).get("slot_seconds", 7200))
+    return [a for a in activity if a.get("last") is not None and now - a["last"] < window]
+
+
 def agent_busy(cfg: dict, st: dict, now: float | None = None) -> dict:
     """Best effort: is the most recently started agent still working?
 
-    ``outcome`` cannot be trusted for this - a busy agent can read as
-    "interrupted" - so we look at when its transcript last moved.  Fail-open: if
-    the API cannot be read we say "not busy" rather than stall the loop.
+    For callers that ask only that (the ask logic).  A pass already holds the
+    activity list, so it uses ``live_agents`` on that instead of re-reading here.
     """
-    sessions = st.get("sessions") or {}
-    if not sessions:
-        return {}
-    starts = st.get("starts") or {}
-    oid = max(sessions, key=lambda k: (starts.get(k) or {}).get("updated") or 0)
-    sid = sessions[oid]
-    w = cfg.get("watch", {})
+    live = live_agents(session_activity(cfg, st, now=now))
+    return live[-1] if live else {}
+
+
+def resume_prompt(oid: str, order: dict) -> str:
+    """What to say to an agent whose turn died with the server."""
+    d = order.get("dir") or "the repository"
+    return "\n".join([
+        "Your previous turn was interrupted: the opencode background server went down",
+        "(the machine ran out of memory) and took your turn with it.  You were stopped",
+        "mid-task and nothing told you, so carry the order on from where it stopped.",
+        "",
+        "Work order %s.  First look at what is already done:" % oid,
+        "  cd %s && git status && git log --oneline -5" % d,
+        "",
+        "Then: do NOT redo committed work - continue the remaining steps, committing",
+        "each one as you go, run the checks the order asks for, and report DONE back",
+        "with ask_claude.  If the order is in fact finished, just send the DONE report.",
+    ])
+
+
+def resume_stalled(cfg: dict, st: dict, activity: list[dict], restarted: dict | None,
+                   dry_run: bool = False) -> list[str]:
+    """Tell the agents a server restart interrupted to carry on.
+
+    Only a restart triggers this: on a healthy server an idle session is just idle
+    (finished, or waiting on something of its own) and re-prompting it would burn
+    turns for nothing.  Bounded three ways - ``resume_max`` per order, one per
+    ``resume_cooldown_seconds``, and ``resume_max_per_pass`` at a time, so a reboot
+    cannot fire up every agent that ever ran - and it never touches an agent that is
+    working, or an order marked finished.
+    """
+    w = cfg.get("watch") or {}
+    if dry_run or not w.get("resume_interrupted", True) or not restarted:
+        return []
+    now = time.time()
+    cooldown = float(w.get("resume_cooldown_seconds", 1800))
+    most = int(w.get("resume_max", 3))
+    per_pass = int(w.get("resume_max_per_pass", 2))
+    freshest = float(w.get("resume_max_age_seconds", 21600))
+    res = st.setdefault("resume", {})
+    done = st.get("finished") or {}
+    cands: list[dict] = []
+    for a in activity:
+        oid = a["order"]
+        rec = (st.get("starts") or {}).get(oid) or {}
+        r = res.get(oid) or {}
+        if rec.get("status") != "started" or oid in done or a.get("live"):
+            continue
+        if a.get("last") is None or now - a["last"] > freshest:
+            continue                     # unreadable, or long past - leave it be
+        if int(r.get("count") or 0) >= most:
+            continue                     # asked enough times - a human's turn
+        if now - float(r.get("at") or 0) < cooldown:
+            continue
+        cands.append(a)
+    if not cands:
+        return []
+    cands.sort(key=lambda a: a["last"], reverse=True)          # freshest first
     binp = os.path.expanduser(w.get("opencode_bin") or "~/.opencode/bin/opencode")
-    try:
-        rows = oc_api(binp, "GET", "/api/session/%s/message" % sid, timeout=30)
-    except Exception as e:
-        log("  could not check whether %s is still working: %s" % (oid, e))
-        return {}
-    rows = rows.get("data") if isinstance(rows, dict) else rows
-    if isinstance(rows, dict):
-        rows = rows.get("messages") or []
-    last = 0.0
-    for r in rows or []:
-        t = (r.get("time") or {}) if isinstance(r, dict) else {}
-        for key in ("completed", "streamed", "created"):
-            v = t.get(key)
-            if isinstance(v, (int, float)):
-                last = max(last, v / 1000.0)
-                break
-    if not last:
-        return {}
-    if (now or time.time()) - last < float(w.get("agent_active_seconds", 1800)):
-        return {"order": oid, "session": sid, "last_activity": last}
-    return {}
+    out: list[str] = []
+    for a in cands[:per_pass]:
+        oid, sid = a["order"], a["session"]
+        order = ((st.get("starts") or {}).get(oid) or {}).get("order") or {}
+        try:
+            oc_api(binp, "POST", "/api/session/%s/prompt" % sid,
+                   {"text": resume_prompt(oid, order)}, timeout=120)
+        except Exception as e:
+            log("  could not resume %s: %s" % (oid, e))
+            continue
+        r = res.get(oid) or {}
+        r.update({"count": int(r.get("count") or 0) + 1, "at": now})
+        res[oid] = r
+        log("  resumed %s (session %s): the restart killed its turn - told it to check "
+            "git and carry on" % (oid, sid))
+        out.append(oid)
+    if len(cands) > len(out):
+        quiet(st, "%d more interrupted order(s) - the rest resume on a later pass"
+              % (len(cands) - len(out)))
+    return out
+
+
+def dispatch_batch(cfg: dict, st: dict, orders: list[dict], dry_run: bool = False,
+                   activity: list[dict] | None = None) -> tuple[list[dict], list[dict]]:
+    """How many of these orders may start now, and which have to wait for a slot.
+
+    An order that has to wait is deliberately left unmarked in state, so the next pass
+    sees it again and starts it the moment an agent frees a slot: nothing is dropped,
+    and the wait is visible in the log.  ``max_agents`` of 0 means no cap.
+    """
+    cap = int((cfg.get("watch") or {}).get("max_agents") or 0)
+    if cap <= 0 or dry_run or not orders:
+        return list(orders), []
+    act = activity if activity is not None else session_activity(cfg, st)
+    working = slot_agents(act, cfg)
+    room = max(0, cap - len(working))
+    holds = st.setdefault("held", {})
+    for o in orders[:room]:
+        holds.pop(o["id"], None)
+    held = list(orders[room:])
+    for o in held:
+        if o["id"] not in holds:
+            log("holding %s: %d/%d agents are already working (max_agents) - it starts "
+                "when one frees a slot" % (o["id"], len(working), cap))
+        holds[o["id"]] = time.time()
+    return list(orders[:room]), held
 
 
 def attention_needed(routed: dict, text: str) -> bool:
@@ -669,6 +886,106 @@ def open_agent_terminal(cfg: dict, oid: str, sid: str, directory: str) -> bool:
     return False
 
 
+def agent_windows(windows: list[dict] | None = None) -> list[dict]:
+    """Every terminal window this watcher opened: [{"pid","sid","script"}].
+
+    Only windows running one of our own terminal scripts count, so the user's windows
+    are never touched.  Read from /proc rather than pgrep on purpose: a pgrep pattern
+    matches the command line of the shell that is looking for it, and kills it.
+    """
+    if windows is not None:
+        return windows
+    out: list[dict] = []
+    pat = re.compile(re.escape(TERMINALS_DIR) + r"/[^\s\"']+\.sh")
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % name, "rb") as fh:
+                args = fh.read().decode("utf-8", "replace").split("\0")
+        except Exception:
+            continue
+        m = pat.search(" ".join(a for a in args if a))
+        if not m:
+            continue
+        script = m.group(0)
+        out.append({"pid": int(name), "sid": os.path.basename(script)[:-3],
+                    "script": script})
+    return out
+
+
+def _close_window(pid: int, script: str) -> None:
+    """SIGTERM the window's whole process group: the terminal and the agent's TUI."""
+    try:
+        pgid = os.getpgid(pid)
+    except Exception:
+        pgid = None
+    if pgid and pgid == pid:
+        os.killpg(pgid, signal.SIGTERM)
+    else:
+        os.kill(pid, signal.SIGTERM)
+
+
+def reap_windows(cfg: dict, st: dict, activity: list[dict] | None = None,
+                 force: bool = False, dry_run: bool = False,
+                 windows: list[dict] | None = None) -> list[str]:
+    """Close the windows of agents that are not working, so idle TUIs stop holding memory.
+
+    ``force`` (what ``watcher.sh reap`` asks for) closes every agent window that is not
+    working right now.  Otherwise a window goes only once its agent has been quiet for
+    ``reap_idle_seconds`` and the window itself is at least that old - closing eagerly
+    would close the very window a 48 minute test run is sitting in.
+    """
+    w = cfg.get("watch") or {}
+    if dry_run or not w.get("launch_terminal", True):
+        return []
+    idle_after = float(w.get("reap_idle_seconds", 7200))
+    now = time.time()
+    act = {a["order"]: a for a in
+           (activity if activity is not None else session_activity(cfg, st))}
+    by_sid = {sid: oid for oid, sid in (st.get("sessions") or {}).items()}
+    done = set(st.get("finished") or {})
+    closed: list[str] = []
+    for win in agent_windows(windows):
+        oid = by_sid.get(win["sid"])
+        if oid is None or oid in closed:
+            continue                        # not one of ours - leave it alone
+        a = act.get(oid) or {}
+        if a.get("live") and oid not in done:
+            continue                        # it is working: never close its window
+        age = now - os.path.getmtime(win["script"]) if os.path.exists(win["script"]) else 0
+        idle = (now - a["last"]) if a.get("last") else 0
+        if not force and age < idle_after and idle < idle_after:
+            continue
+        try:
+            _close_window(win["pid"], win["script"])
+        except Exception as e:
+            log("  could not close the window for %s: %s" % (oid, e))
+            continue
+        try:
+            os.remove(win["script"])
+        except Exception:
+            pass
+        log("  closed the window for %s (%s) - its agent is not working"
+            % (oid, "you asked" if force
+               else "quiet for over %d min" % int(idle_after // 60)))
+        closed.append(oid)
+    return closed
+
+
+def finish_order(st: dict, oid: str) -> None:
+    """Mark an order finished: frees its agent slot and stops any resume.
+
+    Nothing in the loop can tell "the agent has reported DONE" from "the agent is
+    thinking", so a human says so (``watcher.sh done WO-111``).  Memory-wise that is
+    the difference between a slot freed now and one freed two hours from now.
+    """
+    st.setdefault("finished", {})[oid] = time.time()
+    (st.get("resume") or {}).pop(oid, None)
+    (st.get("held") or {}).pop(oid, None)
+    save_state(st)
+
+
 def download_new_files(b: Bridge, st: dict) -> list[dict]:
     """Download any file card Claude has produced that we have not fetched yet."""
     done = set(st.get("files") or [])
@@ -769,16 +1086,20 @@ def reconcile_starts(cfg: dict, st: dict, dry_run: bool = False, delay: float | 
 
 
 def handle_orders(cfg: dict, st: dict, orders: list[dict], files: list[dict] | None = None,
-                  dry_run: bool = False, retry_delay: float | None = None) -> dict:
-    """Mark and start every not-yet-seen order, then reconcile stuck ones.
+                  dry_run: bool = False, retry_delay: float | None = None,
+                  activity: list[dict] | None = None) -> dict:
+    """Mark and start every order that fits, then reconcile stuck ones.
 
     The seen mark (and the start record) are saved *before* the slow agent start,
-    so a crash or a second watcher can never start an order twice.
+    so a crash or a second watcher can never start an order twice.  Orders over the
+    ``max_agents`` cap are handed back untouched by ``dispatch_batch`` and picked up
+    by a later pass.
     """
     files = files or []
     seen = st.get("orders") or {}
     if isinstance(seen, list):  # tolerate an older state file
         seen = {k: "" for k in seen}
+    orders, _held = dispatch_batch(cfg, st, orders, dry_run=dry_run, activity=activity)
 
     for o in orders:
         problems = order_problems(o)
@@ -812,6 +1133,25 @@ def handle_orders(cfg: dict, st: dict, orders: list[dict], files: list[dict] | N
 
 
 def pass_once(cfg: dict, st: dict, dry_run: bool = False) -> dict:
+    # Before anything about the chat: what happened to the agents.  Every turn runs
+    # inside the opencode background server, so if it restarted, turns died with it -
+    # and that must be noticed even when the bridge window is down.
+    restarted = note_service(st, dry_run)
+    if ensure_service(cfg, st, dry_run):
+        rec = st.setdefault("service", {})
+        pid = service_pid()
+        if pid:
+            if not restarted:
+                restarted = {"from": rec.get("pid"), "to": pid}
+            rec["pid"] = pid
+    if restarted:
+        log("the opencode background server was restarted (%s -> %s) - checking whether "
+            "any running order lost its turn with it"
+            % (restarted.get("from"), restarted.get("to")))
+    activity = [] if dry_run else session_activity(cfg, st)
+    if activity:
+        resume_stalled(cfg, st, activity, restarted, dry_run=dry_run)
+        reap_windows(cfg, st, activity, dry_run=dry_run)
     if not cdp_alive():
         if cfg.get("watch", {}).get("auto_launch_bridge", False) and ensure_chrome():
             log("bridge window was down - launched it")
@@ -878,15 +1218,19 @@ def pass_once(cfg: dict, st: dict, dry_run: bool = False) -> dict:
     routed = route_orders(st, orders)
     new = routed["dispatch"]
 
+    # Only the orders that fit under max_agents have their files pulled down now; a
+    # held one is fetched when it starts, so a loaded machine does not do that work
+    # for work that cannot run yet.
+    batch, _held = dispatch_batch(cfg, st, new, dry_run=dry_run, activity=activity)
     files: list[dict] = []
-    if new:
+    if batch:
         try:
             files = download_new_files(b, st)
         except Exception as e:
             log("file download skipped: %s" % e)
         # Hand every file the order names over by absolute path, even when the
         # card download failed: a pointer the agent cannot follow is no pointer.
-        for o in new:
+        for o in batch:
             files, missing = resolve_order_files(o, files)
             if missing:
                 try:
@@ -901,7 +1245,7 @@ def pass_once(cfg: dict, st: dict, dry_run: bool = False) -> dict:
                 log("  %s names %s but it is not on disk - handing the path to the agent"
                     % (o["id"], os.path.basename(p)))
 
-    handle_orders(cfg, st, new, files, dry_run=dry_run)
+    handle_orders(cfg, st, batch, files, dry_run=dry_run, activity=activity)
 
     # What Claude's newest message needs, if anything: an incomplete order, a
     # re-post of one that already ran, or a promise with no order behind it.
@@ -927,18 +1271,68 @@ def pass_once(cfg: dict, st: dict, dry_run: bool = False) -> dict:
     return st
 
 
+def report_status(cfg: dict, st: dict) -> int:
+    """Print what the loop is doing with agents right now (``watcher.sh status``)."""
+    w = cfg.get("watch") or {}
+    cap = int(w.get("max_agents") or 0)
+    act = session_activity(cfg, st)
+    slots = {a["order"] for a in slot_agents(act, cfg)}
+    done = set(st.get("finished") or {})
+    print("agents: %d working, %d holding a slot (max_agents=%s)"
+          % (len(live_agents(act)), len(slots), cap or "none"))
+    for a in act:
+        if a["order"] in done:
+            state = "finished"
+        elif a.get("live"):
+            state = "working"
+        elif a["order"] in slots:
+            state = "slot"
+        else:
+            state = "idle"
+        ago = ("%.0f min ago" % ((time.time() - a["last"]) / 60)) if a.get("last") else "unknown"
+        print("  %-7s %-8s last moved %s" % (a["order"], state, ago))
+    for oid, r in sorted((st.get("resume") or {}).items()):
+        n = int(r.get("count") or 0)
+        print("  %-7s resumed %d time(s)%s"
+              % (oid, n, " - have a look at it" if n >= int(w.get("resume_max", 3)) else ""))
+    for oid in sorted((st.get("held") or {}).keys()):
+        print("  %-7s waiting for a free agent slot" % oid)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Watch the Claude chat for work orders and hand them to an agent.")
     ap.add_argument("--once", action="store_true", help="do a single pass and exit (for a timer)")
     ap.add_argument("--interval", type=int, default=None, help="seconds between passes (default from config, 30)")
     ap.add_argument("--dry-run", action="store_true", help="report work orders but start no agent")
+    ap.add_argument("--status", action="store_true",
+                    help="what is running right now: live agents, slots, resumed and waiting orders")
+    ap.add_argument("--reap", action="store_true",
+                    help="close the windows of agents that are not working, then exit")
+    ap.add_argument("--finish", metavar="ORDER", default=None,
+                    help="mark an order finished (frees its slot, stops any resume), then exit")
     args = ap.parse_args()
+    cfg = load_config()
+
+    # These three only read state and merge their change back, so they are safe to run
+    # beside a live watcher - which is exactly when you want them.
+    if args.finish:
+        finish_order(load_state(), args.finish)
+        print("marked %s finished - its slot is free, and 'watcher.sh reap' will close "
+              "its window" % args.finish)
+        return 0
+    if args.reap:
+        closed = reap_windows(cfg, load_state(), force=True)
+        print("closed %d agent window(s)%s"
+              % (len(closed), (": " + ", ".join(closed)) if closed else " - none was idle"))
+        return 0
+    if args.status:
+        return report_status(cfg, load_state())
 
     if acquire_watcher_lock() is None:
         log("watcher already running (watcher.lock is held) - exiting")
         return 0
 
-    cfg = load_config()
     interval = args.interval or int(cfg.get("watch", {}).get("interval_seconds") or 30)
     log("watcher starting (interval %ss, auto_start=%s)%s" % (
         interval, cfg.get("watch", {}).get("auto_start", True), " [dry run]" if args.dry_run else ""))

@@ -386,6 +386,77 @@ simply not in the list.
 
 ---
 
+## When the machine stops the agents (a restart, or running out of memory)
+
+Every agent's turn runs inside **one process**: the opencode background server. When that
+process dies, every in-flight turn dies with it - silently. On the night of 2026-11-11 it
+happened for real:
+
+```
+03:51-04:04  free memory 4-6% of 6 GB (246 MiB at 03:52); journald "under memory pressure"
+03:53:07     the desktop marks the agent windows unresponsive - the box is thrashing
+03:53:08     every opencode client loses its event stream
+03:53:31+    a stampede of clients each start "opencode serve --service"
+03:55:41     the old server: "managed service registration replaced; shutting down"
+04:03:46     the server that is still running today
+```
+
+Five agents (TUIs + their sessions), three JS test suites and Chrome on a 6 GB machine is
+what did it. WO-108 through WO-111 all stopped **mid-turn**, nothing resumed them, and the
+work only carried on when someone touched those windows. Both repositories were clean
+afterwards - the agents commit each step - so an interruption costs a turn, not work.
+
+The loop now expects this and deals with it:
+
+* **Agents are capped (`max_agents`, default 2).** An order over the cap is left completely
+  unmarked and picked up by a later pass, so nothing is dropped: it is merely the queue
+  working. An agent holds its slot for `slot_seconds` after its last sign of life, because a
+  48 minute end-to-end suite looks idle to any recency check - stacking a third agent on top
+  of that is exactly how the box ran out of memory.
+* **The server comes back once, not in a stampede.** The watcher is the single owner: if the
+  registered pid is gone it runs `opencode service start` itself (at most once a minute),
+  and it never touches a live server.
+* **The turns it interrupted are resumed.** A restart (noticed by the pid changing) makes
+  the watcher re-prompt the agents that were stopped: *"your previous turn was interrupted
+  ... `git status && git log` first ... do NOT redo committed work ... carry on, then report
+  DONE"*. It never interrupts an agent that is working, never touches an order you have
+  marked finished, and is bounded to `resume_max` per order with one per
+  `resume_cooldown_seconds`, `resume_max_per_pass` at a time - a reboot must not fire up
+  every agent that ever ran.
+* **The windows left behind are closed.** An idle agent's window costs 150-250 MB for
+  nothing. `watcher.sh reap` closes every agent window that is not working; on its own the
+  watcher closes one once its agent has been quiet for `reap_idle_seconds` (2 h). A working
+  agent's window is never closed, and neither is any window the watcher did not open.
+
+```bash
+~/claude-bridge/watcher.sh status        # what is running: working / slot / waiting / resumed
+~/claude-bridge/watcher.sh reap          # close the windows of agents that are not working
+~/claude-bridge/watcher.sh done WO-111   # it reported DONE: free its slot, stop resuming it
+```
+
+`done` is worth using: nothing in the loop can tell *"the agent reported DONE"* from *"the
+agent is thinking"*, so telling it frees an agent slot now instead of two hours from now.
+
+| setting | default | meaning |
+|---|---|---|
+| `max_agents` | `2` | how many agents may run at once; `0` = no cap |
+| `slot_seconds` | `7200` | how long an agent keeps its slot after its last sign of life |
+| `service_start_cooldown` | `60` | at most one `opencode service start` this often |
+| `resume_interrupted` | `true` | resume the turns a server restart interrupted |
+| `resume_max` | `3` | how many times one order may be resumed before it is left for a human |
+| `resume_max_per_pass` | `2` | how many orders may be resumed in one pass |
+| `resume_cooldown_seconds` | `1800` | never resume the same order twice inside this |
+| `resume_max_age_seconds` | `21600` | a session quiet longer than this is over, not interrupted |
+| `reap_idle_seconds` | `7200` | close an agent's window after this long of quiet |
+| `agent_active_seconds` | `1800` | the transcript moving inside this window means "working" |
+
+If you would rather systemd owned the server than the watcher, `contrib/opencode.service`
+is a user unit for it (`systemctl --user enable --now opencode`); set `max_agents` and
+`service_start_cooldown` with that in mind. The watcher's own supervision is the default
+because it needs no sudo, and because one starter is what stops the stampede.
+
+---
+
 ## Starting a new chat
 
 A long thread fills up, so you want to continue in a fresh chat. The chat the

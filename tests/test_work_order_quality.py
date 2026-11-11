@@ -60,6 +60,8 @@ def tmp_env() -> str:
     os.makedirs(watcher.DOWNLOADS, exist_ok=True)
     # a test must never open a real terminal window on the user's desktop
     watcher.open_agent_terminal = lambda cfg_, oid, sid, directory: False
+    # ... nor read a real agent transcript from the opencode server
+    watcher.session_activity = lambda cfg_, st_, now=None: []
     return d
 
 

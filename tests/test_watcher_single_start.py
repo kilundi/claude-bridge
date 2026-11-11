@@ -58,6 +58,7 @@ def fake_start(cfg, order, files, inbox_path):
 
 watcher.start_agent = fake_start
 watcher.open_agent_terminal = lambda cfg_, oid, sid, directory: False
+watcher.session_activity = lambda cfg_, st_, now=None: []
 cfg = {"watch": {"auto_start": True, "start_retries": 2, "start_retry_delay": 0}}
 order = json.loads(os.environ["CB_ORDER"])
 
@@ -84,6 +85,8 @@ def tmp_env() -> str:
     os.makedirs(watcher.INBOX, exist_ok=True)
     # a test must never open a real terminal window on the user's desktop
     watcher.open_agent_terminal = lambda cfg_, oid, sid, directory: False
+    # ... nor read a real agent transcript from the opencode server
+    watcher.session_activity = lambda cfg_, st_, now=None: []
     return d
 
 

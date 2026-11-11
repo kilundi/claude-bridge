@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Start, stop or check the claude-bridge work-order watcher.
-#   ./watcher.sh start|stop|status|log
+#   ./watcher.sh start|stop|status|log|reap
+#   ./watcher.sh done WO-111        it reported DONE: free its agent slot now
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PID="$HERE/watcher.pid"
@@ -27,15 +28,25 @@ case "$CMD" in
     ;;
   status)
     if running; then echo "watcher running (pid $(cat "$PID"))"; else echo "watcher not running"; fi
+    python3 "$HERE/watcher.py" --status 2>/dev/null || echo "  (could not read the agents)"
     if [ -f "$HERE/NEEDS-ORDER.md" ]; then
       echo "STALLED: the queue needs an order from Claude - see $HERE/NEEDS-ORDER.md"
     fi
     echo "--- last log lines ---"
     tail -n 8 "$HERE/watcher.log" 2>/dev/null || echo "(no log yet)"
     ;;
+  reap)
+    # Close the windows of agents that are not working.  Safe beside the watcher:
+    # it only reads state, and never closes a window whose agent is working.
+    python3 "$HERE/watcher.py" --reap
+    ;;
+  done)
+    if [ -z "${2:-}" ]; then echo "usage: $0 done <WORK-ORDER-ID>"; exit 2; fi
+    python3 "$HERE/watcher.py" --finish "$2"
+    ;;
   log)
     tail -n 40 -f "$HERE/watcher.log"
     ;;
   *)
-    echo "usage: $0 {start|stop|status|log}"; exit 2;;
+    echo "usage: $0 {start|stop|status|log|reap|done <WORK-ORDER-ID>}"; exit 2;;
 esac

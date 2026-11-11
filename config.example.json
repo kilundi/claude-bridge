@@ -18,6 +18,15 @@
     "ask_grace_seconds": 600,
     "ask_min_seconds": 120,
     "ask_timeout": 180,
-    "agent_active_seconds": 1800
+    "agent_active_seconds": 1800,
+    "max_agents": 2,
+    "slot_seconds": 7200,
+    "service_start_cooldown": 60,
+    "resume_interrupted": true,
+    "resume_max": 3,
+    "resume_max_per_pass": 2,
+    "resume_cooldown_seconds": 1800,
+    "resume_max_age_seconds": 21600,
+    "reap_idle_seconds": 7200
   }
 }

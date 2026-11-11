@@ -1,0 +1,40 @@
+# Optional: let systemd own the opencode background server instead of the watcher.
+#
+# The watcher supervises it by default (see "When the machine stops the agents" in
+# README.md) because that needs no sudo.  This unit is for when you would rather have
+# systemd restart it, or start it at boot.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp contrib/opencode.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now opencode
+#
+# To have it start without you logging in (needs sudo):
+#   sudo loginctl enable-linger $USER
+#
+# Two things to know before you switch:
+#   * opencode replaces its own registration when a second server starts, so a client
+#     that cannot reach ours can still make it flap.  With systemd owning it, that is a
+#     restart rather than a death - but keep watch.max_agents low all the same: memory
+#     pressure is what killed it, not the restart.
+#   * the watcher never touches a live server, so the two do not fight.  If you enable
+#     this, raising watch.service_start_cooldown is harmless belt and braces.
+
+[Unit]
+Description=opencode background server (serves every agent session)
+Documentation=file:%h/claude-bridge/README.md
+After=default.target
+# a flap must not spin: give up and let a human look instead of looping forever
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=%h/.opencode/bin/opencode serve --service
+Restart=always
+RestartSec=5
+# the agent windows are separate processes; never take them down with the server
+KillMode=process
+
+[Install]
+WantedBy=default.target
