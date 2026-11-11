@@ -359,9 +359,13 @@ which one and why, **not** a message that arrives without its screenshot.
 ```python
 # in the agent: take the shot it is talking about, then ask with it
 await page.setViewportSize({"width": 390, "height": 844})
-await page.screenshot({"path": "/tmp/opencode/phone.png", "fullPage": True})
-# ... then: ask_claude(message="the reservations table overflows at 390px", images=["/tmp/opencode/phone.png"])
+await page.screenshot({"path": "~/claude-bridge/shots/phone.png", "fullPage": True})
+# ... then: ask_claude(message="the reservations table overflows at 390px",
+#                      images=["~/claude-bridge/shots/phone.png"])
 ```
+
+Write the picture somewhere durable: `/tmp` is a tmpfs on this machine and a
+screenshot parked there can be gone before you attach it.
 
 `ask_claude` takes the same thing over MCP: `images: ["/abs/path.png", ...]`. Images *from*
 Claude are the other direction and already worked (`--download`, file cards).

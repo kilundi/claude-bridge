@@ -73,10 +73,13 @@ TOOLS = [
                     "description": (
                         "Absolute paths of image files to attach to the message (png/jpg/jpeg/"
                         "webp/gif/bmp, up to 8 files of 20 MB each). A directory means the "
-                        "images in it, newest first. Take the screenshot yourself first - e.g. "
-                        "with Playwright: await page.setViewportSize({width: 390, height: 844}); "
-                        "await page.screenshot({path: '/tmp/opencode/phone.png', fullPage: true}) "
-                        "- then pass its path here with a question about what it shows."
+                        "images in it, newest first. Take the screenshot yourself first - the "
+                        "easiest way is the page_shot tool on this server (whole page, phone "
+                        "width by default), or Playwright directly: await page.setViewportSize("
+                        "{width: 390, height: 844}); await page.screenshot({path: HOME + "
+                        "'/claude-bridge/shots/phone.png', fullPage: true}) - then pass its "
+                        "path here with a question about what it shows. Write it somewhere "
+                        "durable: /tmp is a tmpfs here and the file can vanish before it is sent."
                     ),
                 },
                 "timeout_seconds": {
