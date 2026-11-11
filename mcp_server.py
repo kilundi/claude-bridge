@@ -52,12 +52,27 @@ TOOLS = [
             "delivered to the chat, so do NOT resend it; call claude_availability or "
             "wait_for_claude instead of retrying. If the bridge window is unreachable the "
             "message is saved in the outbox instead of being lost, and flush_outbox sends it "
-            "later."
+            "later. Pass 'images' to show Claude a screenshot (a rendered UI, a phone-width "
+            "layout, a broken page) - words cannot describe a layout problem as quickly as "
+            "the picture can. The bridge refuses to send anything while somebody's own draft "
+            "is in the composer; that comes back as an error naming the draft."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "message": {"type": "string", "description": "The message / status to send to Claude."},
+                "images": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Absolute paths of image files to attach to the message (png/jpg/jpeg/"
+                        "webp/gif/bmp, up to 8 files of 20 MB each). A directory means the "
+                        "images in it, newest first. Take the screenshot yourself first - e.g. "
+                        "with Playwright: await page.setViewportSize({width: 390, height: 844}); "
+                        "await page.screenshot({path: '/tmp/opencode/phone.png', fullPage: true}) "
+                        "- then pass its path here with a question about what it shows."
+                    ),
+                },
                 "timeout_seconds": {
                     "type": "number",
                     "description": "Max seconds to wait for the reply (default 600).",
@@ -268,8 +283,9 @@ def handle(req: dict):
                 if not message:
                     raise ValueError("'message' is required")
                 timeout = float(args.get("timeout_seconds") or DEFAULT_TIMEOUT)
+                images = [str(p) for p in (args.get("images") or [])]
                 try:
-                    reply = Bridge(target_url()).ask(message, timeout=timeout)
+                    reply = Bridge(target_url()).ask(message, timeout=timeout, images=images)
                 except ClaudeUnavailable as e:
                     return {"jsonrpc": "2.0", "id": rid, "result": _content(_unavailable_text(e))}
                 return {"jsonrpc": "2.0", "id": rid, "result": _content(reply)}

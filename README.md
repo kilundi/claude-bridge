@@ -83,7 +83,7 @@ From an agent (opencode), the `claude-bridge` MCP server exposes a native tool:
 
 | tool | what it does |
 |------|--------------|
-| `ask_claude(message, timeout_seconds?)` | send a message, wait, return Claude's reply. If Claude is out of messages it returns `CLAUDE_UNAVAILABLE` in about a second (the message is still delivered) |
+| `ask_claude(message, timeout_seconds?, images?)` | send a message, wait, return Claude's reply. If Claude is out of messages it returns `CLAUDE_UNAVAILABLE` in about a second (the message is still delivered). `images` attaches screenshots (absolute paths, or a directory) |
 | `claude_availability()` | can Claude answer right now? and when the limit resets |
 | `wait_for_claude(timeout_seconds?)` | block until Claude can answer again, then continue |
 | `outbox()` | list reports saved while the bridge was unreachable |
@@ -335,6 +335,49 @@ work order: the agent creates the file at that path (directories included) and c
 attached file there. Claude may say it in the goal in plain words, or add a line
 `save: /the/path`.
 
+### Showing Claude a screenshot (images both ways)
+
+Words describe a layout badly. The bridge can put a picture in the chat the same way the
+paperclip does — it sets real files on the page's own `<input type=file>`, so claude.ai
+uploads them exactly as if you had picked them:
+
+```bash
+# the phone layout breaks at 390px - ask with the picture attached
+ask-claude --image ~/Pictures/phone.png "this breaks on a phone - what would you change?"
+
+ask-claude --image ~/Pictures/Shots/ "the two newest runs, side by side"   # a directory = its images, newest first
+ask-claude --image before.png --image after.png "which one is better?"     # repeat it
+```
+
+Up to **8 images of 20 MB** each (`png/jpg/jpeg/webp/gif/bmp`), checked before anything
+touches the page: a wrong path, a non-image, or an oversized file is an error that says
+which one and why, **not** a message that arrives without its screenshot.
+
+**An agent can do it too** — that is how a UI review round-trips without you in the middle:
+
+```python
+# in the agent: take the shot it is talking about, then ask with it
+await page.setViewportSize({"width": 390, "height": 844})
+await page.screenshot({"path": "/tmp/opencode/phone.png", "fullPage": True})
+# ... then: ask_claude(message="the reservations table overflows at 390px", images=["/tmp/opencode/phone.png"])
+```
+
+`ask_claude` takes the same thing over MCP: `images: ["/abs/path.png", ...]`. Images *from*
+Claude are the other direction and already worked (`--download`, file cards).
+
+**The box is never somebody else's to send.** A message only ever contains what the bridge
+itself typed. If the composer already holds something — a half-written thought, a screenshot
+you pasted and did not send — the send is **refused** and says what is in the way:
+
+```bash
+ask-claude --composer     # what is in the box right now (draft text, attachments)
+ask-claude --clear        # empty it; a draft's *text* is parked in drafts/ first
+```
+
+A refused **text** report is not lost: it goes to the outbox and is delivered by itself once
+the composer is clear. A refused **image** ask is not queued (the outbox is text) and says
+so, so nothing is ever promised that was not sent.
+
 ---
 
 ## Watching an agent work
@@ -555,6 +598,7 @@ How the bridge handles it:
 | `bridge-target.json` | the claude.ai tab the bridge drives (so extra tabs cannot steal a message) |
 | `inbox/` | work orders Claude has handed over (`<id>.md`) |
 | `downloads/` | file cards fetched from the chat |
+| `drafts/` | the text of a draft `--clear` had to empty out of the composer (never sent, never lost) |
 | `state.json` | which orders and files have been handled (watcher) |
 | `watcher.log` | what the watcher has done |
 | `terminal.log` | output of the agent windows the watcher opened |

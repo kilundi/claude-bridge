@@ -58,6 +58,17 @@ COMPACT_PROMPT = (
     "state of the work (repos, branches, commits), and the exact next action. Keep it short."
 )
 
+# --- images: what the bridge is willing to carry ---------------------------------
+# A screenshot is often the only honest way to describe a UI problem ("the phone
+# layout breaks" means little until Claude sees it).  The page takes files through a
+# plain <input type=file>, so the bridge sets real files on it and lets claude.ai
+# upload them exactly as the paperclip would - no clipboard tricks.
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+MAX_ATTACH_FILES = 8
+MAX_ATTACH_BYTES = 20 * 1024 * 1024          # claude.ai's own ceiling is about 30 MB
+ATTACH_TIMEOUT = float(os.environ.get("CLAUDE_BRIDGE_ATTACH_TIMEOUT", "120"))
+DRAFTS = os.path.join(HERE, "drafts")
+
 
 class ClaudeUnavailable(RuntimeError):
     """Claude cannot answer right now - out of free messages, or similar.
@@ -84,6 +95,74 @@ class ClaudeUnavailable(RuntimeError):
         else:
             msg += "; nothing was sent"
         super().__init__(msg)
+
+
+class ComposerBlocked(RuntimeError):
+    """The composer holds words or images the bridge did not put there.
+
+    A send would post them along with our message, so it is refused instead.  The
+    refused text is queued in the outbox, so once the composer is clear (the person
+    sends their draft, or ``ask-claude --clear`` parks it) the report goes out on
+    its own.  This is deliberately not a ``ClaudeUnavailable``: Claude is fine, and
+    an agent that reads "unavailable" would sleep instead of telling somebody.
+    """
+
+    def __init__(self, text: str, queued: str = ""):
+        self.queued = queued or ""
+        msg = text
+        if self.queued:
+            msg += (f"\nThe refused message is saved in {self.queued} and goes out on its "
+                    "own once the composer is clear.")
+        super().__init__(msg)
+
+
+def image_paths(items, newest_first: bool = True) -> list[str]:
+    """Turn ``--image`` arguments into real image files, absolute, de-duplicated.
+
+    Each item may be a file or a directory (a directory means "the images in it",
+    so a screenshots folder is one argument).  ``~`` is expanded.  Newest first, so
+    ``--image ~/Pictures/Shots/`` picks up the screenshot that was just taken.
+
+    Anything that is not a usable image is an error that says why: an ask must never
+    go out quietly without the screenshot it promised.
+    """
+    out: list[str] = []
+    for item in items or []:
+        p = os.path.expanduser(str(item or "").strip())
+        if not p:
+            continue
+        if os.path.isdir(p):
+            found = [os.path.join(p, f) for f in os.listdir(p)
+                     if os.path.splitext(f)[1].lower() in IMAGE_EXTS
+                     and os.path.isfile(os.path.join(p, f))]
+            if not found:
+                raise ValueError("no images in %s (looking for %s)"
+                                 % (p, ", ".join(IMAGE_EXTS)))
+            found.sort(key=os.path.getmtime, reverse=newest_first)
+            out.extend(found)
+            continue
+        if not os.path.isfile(p):
+            raise ValueError(f"no such image: {p}")
+        ext = os.path.splitext(p)[1].lower()
+        if ext not in IMAGE_EXTS:
+            raise ValueError("not an image: %s (%s) - the bridge attaches %s"
+                             % (p, ext or "no extension", ", ".join(IMAGE_EXTS)))
+        out.append(p)
+
+    uniq: list[str] = []
+    for p in out:
+        full = os.path.abspath(p)
+        if full not in uniq:
+            uniq.append(full)
+    if len(uniq) > MAX_ATTACH_FILES:
+        raise ValueError("%d images is more than the bridge attaches at once (%d) - name the "
+                         "few that matter" % (len(uniq), MAX_ATTACH_FILES))
+    for p in uniq:
+        size = os.path.getsize(p)
+        if size > MAX_ATTACH_BYTES:
+            raise ValueError("%s is %.1f MB, over the %.0f MB the bridge will attach"
+                             % (p, size / 1e6, MAX_ATTACH_BYTES / 1e6))
+    return uniq
 
 
 OUTBOX = os.path.join(HERE, "outbox")
@@ -479,6 +558,40 @@ JS_CLEAR_COMPOSER = r"""
 })()
 """
 
+# What the composer is holding.  Scoped to the composer on purpose: the transcript
+# also contains [data-testid="file-thumbnail"] nodes (images that were *sent*), and
+# counting those would make the bridge think a draft was in its way.
+JS_COMPOSER_ATTACH = r"""
+(() => {
+  const ed = document.querySelector('[data-testid="chat-input"]');
+  const box = ed ? (ed.closest('fieldset') || ed.parentElement) : null;
+  const thumbs = box ? [...box.querySelectorAll('[data-testid="file-thumbnail"]')] : [];
+  const name = el => (el.innerText || '').replace(/[\uE000-\uF8FF]/g, '')
+                                  .replace(/\s+/g, ' ').trim();
+  const send = document.querySelector('[data-testid="chat-input-send"]');
+  return JSON.stringify({
+    found: !!box,
+    thumbs: thumbs.length,
+    names: thumbs.map(name).filter(Boolean),
+    uploading: box ? box.querySelectorAll('[role="progressbar"],[aria-busy="true"]').length : 0,
+    loading: thumbs.filter(e => /^(loading|uploading)/i.test(name(e))).length,
+    text: ed ? (ed.innerText || '') : '',
+    sendDisabled: send ? !!send.disabled : null
+  });
+})()
+"""
+
+JS_REMOVE_ATTACHMENTS = r"""
+(() => {
+  const ed = document.querySelector('[data-testid="chat-input"]');
+  const box = ed ? (ed.closest('fieldset') || ed.parentElement) : null;
+  if (!box) return 'no-composer';
+  const btns = [...box.querySelectorAll('button[aria-label^="Remove"]')];
+  btns.forEach(b => b.click());
+  return 'removed ' + btns.length;
+})()
+"""
+
 JS_PROBE = r"""
 (() => {
   const ids = {};
@@ -858,6 +971,90 @@ class Bridge:
     def probe(self, c: CDP) -> dict:
         return json.loads(c.js(JS_PROBE))
 
+    # ---------------------------------------------------------------- the composer
+    def composer_state(self, c: CDP) -> dict:
+        """What the composer holds right now: draft text, attached images, upload state."""
+        return json.loads(c.js(JS_COMPOSER_ATTACH))
+
+    def clear_composer(self, c: CDP, park_dir: str | None = None) -> dict:
+        """Empty the composer, so the next message is only what the bridge typed.
+
+        A draft nobody sent is text the bridge did not write, and it must never ride
+        along with a report.  The text is parked on disk first (``drafts/``) so
+        clearing is never a way to lose somebody's words.  An attachment cannot be
+        restored - its bytes live in the page, not on this disk.
+        """
+        st = self.composer_state(c)
+        parked = ""
+        text = (st.get("text") or "").strip()
+        if text and park_dir:
+            os.makedirs(park_dir, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            parked = os.path.join(park_dir, f"draft-{stamp}.md")
+            with open(parked, "w") as fh:
+                fh.write(f"<!-- cleared from the composer {stamp} because a report was "
+                         "waiting behind it -->\n")
+                if st.get("names"):
+                    fh.write("<!-- it had %d attachment(s): %s - the files were in the page, "
+                             "not on disk, so they are not saved here -->\n"
+                             % (len(st["names"]), ", ".join(st["names"])))
+                fh.write(text + "\n")
+        if st.get("thumbs"):
+            c.js(JS_REMOVE_ATTACHMENTS)
+            time.sleep(0.6)
+        if text:
+            c.js(JS_CLEAR_COMPOSER)
+            time.sleep(0.3)
+        return {"was": st, "parked": parked}
+
+    def attach(self, c: CDP, paths: list[str], timeout: float = ATTACH_TIMEOUT) -> dict:
+        """Put image files in the composer and wait until claude.ai has uploaded them.
+
+        The page's own ``<input type=file>`` is the seam: CDP sets real files on it
+        (the browser runs on this machine, so its paths are the browser's paths) and
+        the page's change handler uploads them exactly as the paperclip would.
+        Nothing is sent here.  Returns {before, thumbs, names, uploaded}.
+        """
+        before = self.composer_state(c)
+        if not before.get("found"):
+            raise ClaudeUnavailable("no composer in the bridge window", sent=False)
+        if before.get("thumbs", 0) + len(paths) > MAX_ATTACH_FILES:
+            raise ComposerBlocked(
+                "the composer already holds %d attachment(s), and adding %d would pass the "
+                "%d-image limit" % (before["thumbs"], len(paths), MAX_ATTACH_FILES))
+        c.call("DOM.enable")
+        root = c.call("DOM.getDocument", {"depth": 1})["root"]["nodeId"]
+        node = c.call("DOM.querySelector",
+                      {"nodeId": root, "selector": 'input[type="file"]'}).get("nodeId")
+        if not node:
+            raise RuntimeError("no file input in the page - is the chat fully loaded? "
+                               "(ask-claude --probe shows what is there)")
+        c.call("DOM.setFileInputFiles", {"files": list(paths), "nodeId": node})
+
+        want = before.get("thumbs", 0) + len(paths)
+        deadline = time.time() + timeout
+        seen = before
+        quiet = 0
+        while time.time() < deadline:
+            time.sleep(0.5)
+            seen = self.composer_state(c)
+            if (seen.get("thumbs", 0) >= want and not seen.get("uploading")
+                    and not seen.get("loading")):
+                quiet += 1
+                if quiet >= 2:            # two quiet reads: the upload is finished
+                    break
+            else:
+                quiet = 0
+        else:
+            raise RuntimeError(
+                "the images did not finish uploading in %.0fs (the composer shows %d of %d "
+                "attached: %s) - asked for: %s"
+                % (timeout, seen.get("thumbs", 0), want,
+                   ", ".join(seen.get("names") or []) or "nothing",
+                   ", ".join(os.path.basename(p) for p in paths)))
+        return {"before": before.get("thumbs", 0), "thumbs": seen.get("thumbs", 0),
+                "names": seen.get("names", []), "uploaded": len(paths)}
+
     def _set_downloads(self, c: "CDP", path: str) -> str:
         params = {"behavior": "allow", "downloadPath": path, "eventsEnabled": True}
         try:
@@ -980,11 +1177,34 @@ class Bridge:
                 nap = min(nap, max(1.0, av["wait_seconds"] + 5))
             time.sleep(min(nap, poll_every))
 
-    def send(self, c: CDP, text: str) -> dict:
+    def send(self, c: CDP, text: str, images=None) -> dict:
         st = self.state(c)
         if not st.get("composer"):
             raise ClaudeUnavailable(
                 "not signed in to claude.ai in the bridge window", sent=False)
+        images = [str(p) for p in (images or [])]
+
+        # The rule: the bridge sends only what it typed itself.  A draft somebody
+        # left in the box (words, or a pasted screenshot) would be posted along with
+        # our message, which is how a half-written thought becomes a work order.
+        hold = self.composer_state(c)
+        draft = (hold.get("text") or "").strip()
+        if draft or hold.get("thumbs"):
+            what = []
+            if draft:
+                what.append("text (%r%s)" % (draft[:60], "..." if len(draft) > 60 else ""))
+            if hold.get("thumbs"):
+                what.append("%d attachment(s): %s"
+                            % (hold["thumbs"], ", ".join(hold.get("names") or []) or "unnamed"))
+            raise ComposerBlocked(
+                "the bridge composer is not empty - it holds %s, which the bridge did not put "
+                "there, so nothing was sent.%s Send that draft yourself, or run "
+                "'ask-claude --clear' to park its text in %s and empty the box."
+                % (" and ".join(what),
+                   (" The %d image(s) were NOT attached." % len(images)) if images else "",
+                   DRAFTS))
+
+        attached = self.attach(c, images) if images else None
         before = st["total"]
         c.js(JS_MARK_OLD)
         focus = c.js(JS_FOCUS_COMPOSER)
@@ -1002,7 +1222,7 @@ class Bridge:
         if click != "clicked-send":
             c.press_enter()
             click = "pressed-enter"
-        return {"before": before, "click": click, "landed": landed[:200]}
+        return {"before": before, "click": click, "landed": landed[:200], "attached": attached}
 
     def wait_reply(self, c: CDP, before: int, timeout: float) -> str:
         deadline = time.time() + timeout
@@ -1112,24 +1332,43 @@ class Bridge:
                 raise
         return self.ask(COMPACT_PROMPT, timeout=timeout)
 
-    def ask(self, text: str, timeout: float = DEFAULT_TIMEOUT) -> str:
+    def ask(self, text: str, timeout: float = DEFAULT_TIMEOUT, images=None) -> str:
+        images = [str(p) for p in (images or [])]
         try:
             c = self.connect()
         except Exception as e:
-            # The window is down and could not be launched.  Do not lose the
-            # report - keep it and raise a signal the caller can act on.
+            # The window is down and could not be launched.  Do not lose the report -
+            # keep it and raise a signal the caller can act on.  An image cannot be
+            # kept this way (the outbox is text), so say so plainly rather than
+            # sending a message that promises a screenshot it no longer has.
+            if images:
+                raise ClaudeUnavailable(
+                    "the bridge window is not reachable; the %d image(s) were NOT sent - the "
+                    "outbox keeps text only, so run this again once the window is back"
+                    % len(images), sent=False) from e
             raise ClaudeUnavailable(
                 "the bridge window is not reachable", sent=False,
                 queued=queue_message(text, f"bridge down: {e}")) from e
         try:
-            return self._ask_with(c, text, timeout)
+            return self._ask_with(c, text, timeout, images=images)
         finally:
             c.close()
 
-    def _ask_with(self, c: CDP, text: str, timeout: float) -> str:
+    def _ask_with(self, c: CDP, text: str, timeout: float, images=None) -> str:
         """Send and wait on an already-connected session (see ``ask``)."""
         try:
-            info = self.send(c, text)
+            info = self.send(c, text, images=images)
+        except ComposerBlocked as e:
+            # Claude is fine; the composer is not ours to empty.  Keep a text report so
+            # it goes out by itself once somebody clears the box, and tell the caller
+            # exactly what is in the way.
+            if not (text.strip() and not images):
+                raise
+            try:
+                path = queue_message(text, "the composer held a draft")
+            except Exception:                      # noqa: BLE001 - the refusal matters more
+                raise e
+            raise ComposerBlocked(str(e), queued=path) from e
         except ClaudeUnavailable as e:
             # Nothing reached the chat (signed out, no composer): keep a copy.
             if not e.queued:
@@ -1208,6 +1447,13 @@ def main(argv=None):
     ap.add_argument("--download", metavar="MATCH", nargs="?", const="", default=None,
                     help="download Claude's file card(s); optional MATCH on the title")
     ap.add_argument("--save-chat", action="store_true", help="remember the claude.ai chat currently open in the bridge window")
+    ap.add_argument("--image", metavar="PATH", action="append", default=None,
+                    help="attach an image to the message (repeatable; a directory means its "
+                         "images, newest first)")
+    ap.add_argument("--composer", action="store_true",
+                    help="print what the composer holds (draft text, attached images)")
+    ap.add_argument("--clear", action="store_true",
+                    help="empty the composer before sending; a draft's text is parked in drafts/")
     ap.add_argument("--new-chat", action="store_true",
                     help="open a fresh chat in the bridge window and make it the chat we use "
                          "(add a message to seed it, e.g. a handoff summary)")
@@ -1215,6 +1461,15 @@ def main(argv=None):
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     args = ap.parse_args(argv)
+
+    # Read the image arguments before anything touches the page: a typo in a path is
+    # an error now, not a message that arrives without the screenshot it promised.
+    images: list[str] = []
+    if args.image:
+        try:
+            images = image_paths(args.image)
+        except ValueError as e:
+            ap.error(str(e))
 
     b = Bridge(args.url or args.goto)
     try:
@@ -1282,6 +1537,27 @@ def main(argv=None):
         # chat first is exactly what made "remember this new chat" impossible.
         c = b.connect(navigate=not (args.save_chat or args.new_chat))
         try:
+            cleared = None
+            if args.clear:
+                cleared = b.clear_composer(c, park_dir=DRAFTS)
+                if not args.message and not (args.new_chat or args.composer):
+                    was = cleared["was"]
+                    draft = (was.get("text") or "").strip()
+                    if args.json:
+                        print(json.dumps(cleared, indent=1))
+                    elif was.get("thumbs") or draft:
+                        bits = []
+                        if was.get("thumbs"):
+                            bits.append("%d attachment(s) removed" % was["thumbs"])
+                        if draft:
+                            bits.append("%d character(s) of draft text%s"
+                                        % (len(draft),
+                                           (" parked in %s" % cleared["parked"])
+                                           if cleared["parked"] else " dropped"))
+                        print("composer cleared: " + ", ".join(bits))
+                    else:
+                        print("the composer was already empty")
+                    return 0
             if args.goto:
                 c.call("Page.navigate", {"url": args.goto})
                 for _ in range(60):
@@ -1292,13 +1568,15 @@ def main(argv=None):
                     except Exception:
                         continue
                 time.sleep(0.4)
-                if not (args.probe or args.status or args.read or args.save_chat or args.new_chat or args.compact or args.slash or args.message):
+                if not (args.probe or args.status or args.read or args.save_chat or args.new_chat
+                        or args.compact or args.slash or args.message or args.composer
+                        or args.clear):
                     args.status = True
             if args.new_chat:
                 c.call("Page.navigate", {"url": NEW_CHAT_URL})
                 b._wait_page(c, want_composer=True, timeout=60.0)
                 text = " ".join(args.message).strip()
-                reply = b._ask_with(c, text, args.timeout) if text else None
+                reply = b._ask_with(c, text, args.timeout, images=images) if text else None
                 st = b.state(c)
                 url = (st.get("url") or "").split("#")[0]
                 if "claude.ai" not in url:
@@ -1340,6 +1618,8 @@ def main(argv=None):
             elif args.read:
                 st = b.last_message(c)
                 out = {"last": st.get("last", ""), "streaming": st.get("streaming"), "total": st.get("total")}
+            elif args.composer:
+                out = b.composer_state(c)
             elif args.compact or args.slash:
                 cmd = args.slash or "/compact"
                 b.send_slash(c, cmd)
@@ -1378,9 +1658,16 @@ def main(argv=None):
                     text = " ".join(args.message).strip()
                 if not text:
                     ap.error("no message given (use --read/--status/--probe/--open)")
-                reply = b._ask_with(c, text, args.timeout)
+                if cleared:
+                    was = cleared["was"]
+                    draft = (was.get("text") or "").strip()
+                    print("note: cleared %d attachment(s) and %d character(s) of draft text from the "
+                          "composer first%s" % (was.get("thumbs", 0), len(draft),
+                                                (" (parked in %s)" % cleared["parked"])
+                                                if cleared["parked"] else ""), file=sys.stderr)
+                reply = b._ask_with(c, text, args.timeout, images=images)
                 if args.json:
-                    print(json.dumps({"sent": text, "reply": reply}))
+                    print(json.dumps({"sent": text, "images": images, "reply": reply}))
                 else:
                     print(reply)
                 return 0
