@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 
@@ -35,6 +37,10 @@ from bridge import (  # noqa: E402
     start_bridge,
     target_url,
 )
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PAGE_SHOT = os.path.join(HERE, "page-shot")
+SHOTS_DIR = os.path.join(HERE, "shots")
 
 PROTOCOL = "2024-11-05"
 SERVER = {"name": "claude-bridge", "version": "1.0.0"}
@@ -170,6 +176,68 @@ TOOLS = [
         },
     },
     {
+        "name": "page_shot",
+        "description": (
+            "Screenshot a page of a web app you are working on, so Claude can SEE the "
+            "layout instead of reading a description of it. The whole page is captured by "
+            "default (a phone form is thousands of pixels tall and the part that breaks is "
+            "usually below the fold), at 390x844 unless you say otherwise. It uses the "
+            "app's own Playwright from `from_dir` (default: your working directory) in a "
+            "throwaway browser context, so nobody is signed out. Returns the file path, "
+            "pixel size and bytes - then pass that path to ask_claude in `images`. "
+            "Use `sign_in` for a page behind a login, and `open` to expand the accordions "
+            "a reviewer needs to see. Example for a Vite app on localhost with a form: "
+            "page_shot(url='http://localhost:5173/items/new', flatten=true, "
+            "open=['[data-testid=\"section-toggle-catalogue\"]'], expect='[data-testid=\"page-title\"]')."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The page to shoot."},
+                "out": {"type": "string",
+                        "description": "Where to write the png (default: ~/claude-bridge/shots/)."},
+                "from_dir": {"type": "string",
+                             "description": "Directory whose node_modules holds Playwright "
+                                            "(default: the current working directory)."},
+                "width": {"type": "number", "description": "Viewport width in px (default 390: a phone)."},
+                "height": {"type": "number", "description": "Viewport height in px (default 844)."},
+                "full_page": {"type": "boolean",
+                              "description": "Capture the whole document, not the viewport "
+                                             "(default true - leave it true for a phone check)."},
+                "flatten": {"type": "boolean",
+                            "description": "Put sticky/fixed bars back in the flow before the "
+                                           "shot (default false). Do use it for a full-page "
+                                           "shot: otherwise a header paints halfway down and "
+                                           "reads like a layout bug that is not there."},
+                "open": {"type": "array", "items": {"type": "string"},
+                         "description": "Selectors to click before shooting (accordions, tabs). "
+                                        "Already-open sections are left open."},
+                "expect": {"type": "string",
+                           "description": "A selector that must be visible on the page - if it "
+                                          "never appears the shot is still written but the tool "
+                                          "says so (a login screen is not the app)."},
+                "wait_ms": {"type": "number", "description": "Extra settle time (default 900)."},
+                "timeout_ms": {"type": "number",
+                               "description": "How long to wait for the page (default 30000)."},
+                "sign_in": {
+                    "type": "object",
+                    "description": "Sign in through the app's own form before shooting.",
+                    "properties": {
+                        "path": {"type": "string", "description": "Sign-in path, e.g. /signin."},
+                        "fill": {"type": "object",
+                                 "description": "Selector -> value, e.g. "
+                                                "{\"[data-testid=\\\"signin-email\\\"]\": "
+                                                "\"admin@example.com\"}."},
+                        "click": {"type": "string", "description": "The submit selector."},
+                        "ready": {"type": "string",
+                                  "description": "Selector that appears once signed in."},
+                    },
+                },
+            },
+            "required": ["url"],
+        },
+    },
+    {
         "name": "check_work",
         "description": (
             "Read the chat for a work order from Claude - the planner writes them as a "
@@ -237,6 +305,64 @@ def _unavailable_text(e: ClaudeUnavailable) -> str:
     bits.append("Call claude_availability to check, or wait_for_claude to continue "
                 "automatically instead of retrying now.")
     return " ".join(bits)
+
+
+def page_shot_argv(a: dict) -> list[str]:
+    """The page-shot command line for an MCP call (separate so it can be tested)."""
+    url = str(a.get("url") or "").strip()
+    if not url:
+        raise ValueError("'url' is required")
+    out = str(a.get("out") or "").strip() or os.path.join(
+        SHOTS_DIR, time.strftime("shot-%Y%m%d-%H%M%S") + ".png")
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    argv = ["node", PAGE_SHOT, url, out,
+            "--width", str(int(a.get("width") or 390)),
+            "--height", str(int(a.get("height") or 844)),
+            "--timeout", str(int(a.get("timeout_ms") or 30000)),
+            "--from", str(a.get("from_dir") or os.getcwd()),
+            "--wait", str(int(a.get("wait_ms") or 900)),
+            "--json"]
+    argv.append("--full" if a.get("full_page", True) else "--viewport")
+    if a.get("flatten"):
+        argv.append("--flatten")
+    for sel in a.get("open") or []:
+        argv += ["--open", str(sel)]
+    if a.get("expect"):
+        argv += ["--expect", str(a["expect"])]
+    si = a.get("sign_in") or {}
+    if si:
+        argv += ["--signin", str(si.get("path") or "/signin")]
+        for sel, val in (si.get("fill") or {}).items():
+            argv += ["--fill", "%s=%s" % (sel, val)]
+        if si.get("click"):
+            argv += ["--click", str(si["click"])]
+        if si.get("ready"):
+            argv += ["--ready", str(si["ready"])]
+    return argv
+
+
+def run_page_shot(a: dict) -> dict:
+    """Run page-shot and report what it produced (or raise with the reason)."""
+    if not shutil.which("node"):
+        raise RuntimeError("node is not installed - page-shot needs it to run the app's playwright")
+    if not os.path.exists(PAGE_SHOT):
+        raise RuntimeError("page-shot is missing from %s" % HERE)
+    argv = page_shot_argv(a)
+    timeout = float(a.get("timeout_ms") or 30000) / 1000.0 + 90.0
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    data: dict = {}
+    for line in reversed((proc.stdout or "").strip().splitlines()):
+        try:
+            data = json.loads(line)
+            break
+        except Exception:                                  # noqa: BLE001 - not the json line
+            continue
+    if proc.returncode != 0 or not data:
+        why = ((proc.stderr or "").strip() or (proc.stdout or "").strip() or "no output")
+        raise RuntimeError("page-shot failed (exit %d): %s" % (proc.returncode, why))
+    if (proc.stderr or "").strip():
+        data["warnings"] = proc.stderr.strip()
+    return data
 
 
 def handle(req: dict):
@@ -342,6 +468,9 @@ def handle(req: dict):
                 return {"jsonrpc": "2.0", "id": rid, "result": _content(res or "(compacted)")}
             if name == "bridge_up":
                 return {"jsonrpc": "2.0", "id": rid, "result": _content(json.dumps(start_bridge(), indent=1))}
+            if name == "page_shot":
+                return {"jsonrpc": "2.0", "id": rid,
+                        "result": _content(json.dumps(run_page_shot(args), indent=1))}
             if name == "check_work":
                 b = Bridge(target_url())
                 c = b.connect(want_composer=False)

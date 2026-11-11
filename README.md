@@ -93,6 +93,7 @@ From an agent (opencode), the `claude-bridge` MCP server exposes a native tool:
 | `check_work()` | read the work order Claude last wrote in the chat |
 | `fetch_claude_files(match?, timeout_seconds?)` | download the files Claude produced in the chat |
 | `compact_conversation(timeout_seconds?)` | ask Claude for a compact handoff summary (see below) |
+| `page_shot(url, out?, from_dir?, width?, height?, full_page?, flatten?, open?, expect?, wait_ms?, timeout_ms?, sign_in?)` | screenshot a page you are working on — the whole page at phone width by default — and hand the path to `ask_claude(images=...)` |
 
 So an agent can literally call `ask_claude` when it finishes a task.
 
@@ -365,6 +366,36 @@ await page.screenshot({"path": "/tmp/opencode/phone.png", "fullPage": True})
 `ask_claude` takes the same thing over MCP: `images: ["/abs/path.png", ...]`. Images *from*
 Claude are the other direction and already worked (`--download`, file cards).
 
+#### Taking the shot in the first place
+
+A viewport screenshot of a phone is nearly useless — a form is 3000 px tall and the part
+that breaks is below the fold — so `page-shot` captures the **whole document**, at a phone
+width, retina, with the app's own Playwright (nothing installed, and a throwaway browser
+context so nobody gets signed out):
+
+```bash
+page-shot http://localhost:5173/items/new phone.png \
+  --from ~/projects/myapp \
+  --signin /signin \
+  --fill '[data-testid="signin-email"]=you@example.com' \
+  --fill '[data-testid="signin-password"]=secret' \
+  --click '[data-testid="signin-submit"]' --ready '[data-testid="page"]' \
+  --expect '[data-testid="page-title"]' \
+  --open '[data-testid="section-toggle-catalogue"]' \
+  --full --flatten
+```
+
+- `--expect` is the honest one: if the page you asked for never rendered, the tool says so
+  (exit 3) rather than hand you a picture of a login screen.
+- `--open` clicks accordions **that are closed** first, so a review sees the sections, and
+  an already-open section is not toggled shut.
+- `--flatten` puts sticky/fixed bars back in the flow. Use it with `--full`: otherwise a
+  header paints halfway down the document and reads like a layout bug that is not there.
+- `--viewport` (off by default) is for "what does the fold look like", not for reviews.
+
+An agent gets the same thing as one tool call — `page_shot(url=..., flatten=true,
+open=[...], sign_in={...})` — and hands the returned path straight to `ask_claude(images=...)`.
+
 **The box is never somebody else's to send.** A message only ever contains what the bridge
 itself typed. If the composer already holds something — a half-written thought, a screenshot
 you pasted and did not send — the send is **refused** and says what is in the way:
@@ -587,7 +618,8 @@ How the bridge handles it:
 | file | purpose |
 |------|---------|
 | `bridge.py` | the CDP driver + CLI (`ask-claude` is a thin wrapper around it) |
-| `mcp_server.py` | MCP (stdio) server exposing `ask_claude` / `claude_availability` / `wait_for_claude` / `claude_status` / `compact_conversation` / `bridge_up` / `check_work` / `fetch_claude_files` |
+| `page-shot` | screenshot a running app with its own Playwright — whole page, phone width by default |
+| `mcp_server.py` | MCP (stdio) server exposing `ask_claude` / `page_shot` / `claude_availability` / `wait_for_claude` / `claude_status` / `compact_conversation` / `bridge_up` / `check_work` / `fetch_claude_files` |
 | `watcher.py` | polls the chat for work orders and starts agents on them |
 | `watcher.sh` | start / stop / status the watcher |
 | `agent-watch.py` | follow a running work-order agent live from any terminal |
@@ -599,6 +631,7 @@ How the bridge handles it:
 | `inbox/` | work orders Claude has handed over (`<id>.md`) |
 | `downloads/` | file cards fetched from the chat |
 | `drafts/` | the text of a draft `--clear` had to empty out of the composer (never sent, never lost) |
+| `shots/` | screenshots taken by `page-shot` when no path was given |
 | `state.json` | which orders and files have been handled (watcher) |
 | `watcher.log` | what the watcher has done |
 | `terminal.log` | output of the agent windows the watcher opened |

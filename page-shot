@@ -1,0 +1,231 @@
+#!/usr/bin/env node
+/*
+ * page-shot - take a screenshot of a running web app, the whole page by default.
+ *
+ *   page-shot http://localhost:5173/items/new shot.png --from ~/projects/myapp
+ *
+ * It exists because "show me the phone layout" is not answered by a picture of the
+ * viewport: a form is 3000 px tall and the part that breaks is the part below the
+ * fold.  So the default is --full (the whole document), at a phone width, retina.
+ *
+ * The app's own Playwright is used (found in --from's node_modules), so nothing is
+ * installed and no shared browser profile is touched: a throwaway context per shot,
+ * so a session here can never sign anybody out.
+ *
+ * Signing in, when the page needs it:
+ *   --signin /signin                       the sign-in page to start on
+ *   --fill 'signin-email=you@example.com'  fill a selector (repeatable)
+ *   --fill 'signin-password=secret'
+ *   --click '[data-testid="signin-submit"]'  press the submit
+ *   --ready '[data-testid="page"]'         wait for the shell to appear
+ *   --expect '[data-testid="page-title"]'  and wait for this on the page you shot
+ *   --open '[data-testid="section-toggle-catalogue"]'   open an accordion first
+ *                                                      (repeatable: a reviewer needs
+ *                                                      the sections that are closed)
+ *
+ * Anything wrong - the app is not up, the sign-in failed, the page you asked for
+ * never rendered - is said out loud and exits non-zero, so a caller never attaches
+ * a picture of a login screen thinking it is the app.
+ */
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const { createRequire } = require('module');
+
+function usage(code) {
+  process.stderr.write(
+    'usage: page-shot URL OUT.png [--from DIR] [--width 390] [--height 844]\n' +
+    '                 [--scale 2] [--viewport] [--wait 900] [--timeout 30000]\n' +
+    '                 [--signin PATH] [--fill SEL=VALUE]... [--click SEL]\n' +
+    '                 [--ready SEL] [--expect SEL] [--open SEL]... [--flatten] [--json]\n');
+  process.exit(code);
+}
+
+function parse(argv) {
+  const opts = {
+    from: '.', width: 390, height: 844, scale: 2, full: true, wait: 900,
+    timeout: 30000, signin: '', fills: [], click: '', ready: '', expect: '',
+    opens: [], flatten: false, json: false, url: '', out: '',
+  };
+  const rest = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    const next = () => {
+      i += 1;
+      if (i >= argv.length) usage(2);
+      return argv[i];
+    };
+    if (a === '--from') opts.from = next();
+    else if (a === '--width') opts.width = parseInt(next(), 10);
+    else if (a === '--height') opts.height = parseInt(next(), 10);
+    else if (a === '--scale') opts.scale = parseFloat(next());
+    else if (a === '--wait') opts.wait = parseInt(next(), 10);
+    else if (a === '--timeout') opts.timeout = parseInt(next(), 10);
+    else if (a === '--signin') opts.signin = next();
+    else if (a === '--fill') opts.fills.push(next());
+    else if (a === '--click') opts.click = next();
+    else if (a === '--ready') opts.ready = next();
+    else if (a === '--expect') opts.expect = next();
+    else if (a === '--open') opts.opens.push(next());
+    else if (a === '--flatten') opts.flatten = true;
+    else if (a === '--full') opts.full = true;
+    else if (a === '--viewport') opts.full = false;
+    else if (a === '--json') opts.json = true;
+    else if (a === '-h' || a === '--help') usage(0);
+    else rest.push(a);
+  }
+  opts.url = rest[0] || '';
+  opts.out = rest[1] || '';
+  if (!opts.url) usage(2);
+  if (!opts.out) opts.out = path.join(process.cwd(), 'shot.png');
+  return opts;
+}
+
+function loadPlaywright(from) {
+  const base = path.resolve(from);
+  const req = createRequire(path.join(base, 'package.json'));
+  const tried = [];
+  for (const name of ['playwright', '@playwright/test', 'playwright-core']) {
+    try {
+      return { pw: req(name), name };
+    } catch (e) {
+      tried.push(name);
+    }
+  }
+  throw new Error(`no playwright in ${base} (tried ${tried.join(', ')}) - pass --from <the app repo>`);
+}
+
+function pngSize(file) {
+  const b = fs.readFileSync(file);
+  if (b.slice(1, 4).toString() !== 'PNG') return null;
+  return { width: b.readUInt32BE(16), height: b.readUInt32BE(20) };
+}
+
+function emit(opts, data) {
+  if (opts.json) process.stdout.write(JSON.stringify(data) + '\n');
+  else {
+    process.stdout.write(`shot  ${data.path}\n`);
+    process.stdout.write(`      ${data.width}x${data.height} px, ${(data.bytes / 1024).toFixed(0)} KB, ` +
+      `${data.full_page ? 'whole page' : 'viewport'} at ${data.viewport.width}x${data.viewport.height}` +
+      `${data.expected ? '' : '  (WARNING: --expect never appeared)'}\n`);
+  }
+}
+
+async function main() {
+  const opts = parse(process.argv.slice(2));
+  let pw;
+  try {
+    pw = loadPlaywright(opts.from);
+  } catch (e) {
+    process.stderr.write(`page-shot: ${e.message}\n`);
+    process.exit(2);
+  }
+  const browser = await pw.pw.chromium.launch();
+  try {
+    const context = await browser.newContext({
+      viewport: { width: opts.width, height: opts.height },
+      deviceScaleFactor: opts.scale,
+      isMobile: opts.width <= 500,
+      hasTouch: opts.width <= 500,
+    });
+    const page = await context.newPage();
+
+    if (opts.signin) {
+      const base = new URL(opts.url);
+      const signin = new URL(opts.signin, base).toString();
+      await page.goto(signin, { waitUntil: 'domcontentloaded', timeout: opts.timeout });
+      for (const f of opts.fills) {
+        const at = f.lastIndexOf('=');          // split on the LAST =: selectors contain =
+        if (at < 1) throw new Error(`--fill needs SEL=VALUE, got ${JSON.stringify(f)}`);
+        const sel = f.slice(0, at);
+        const value = f.slice(at + 1);
+        const el = page.locator(sel).first();
+        await el.waitFor({ state: 'visible', timeout: opts.timeout });
+        await el.fill(value);
+      }
+      if (opts.click) await page.locator(opts.click).first().click({ timeout: opts.timeout });
+      if (opts.ready) {
+        try {
+          await page.locator(opts.ready).first().waitFor({ state: 'visible', timeout: opts.timeout });
+        } catch (e) {
+          throw new Error(`the sign-in did not finish: ${opts.ready} never appeared`);
+        }
+      }
+    }
+
+    await page.goto(opts.url, { waitUntil: 'networkidle', timeout: opts.timeout });
+    let expected = true;
+    if (opts.expect) {
+      try {
+        await page.locator(opts.expect).first().waitFor({ state: 'visible', timeout: opts.timeout });
+      } catch (e) {
+        expected = false;
+      }
+    }
+    if (opts.wait) await page.waitForTimeout(opts.wait);
+    for (const sel of opts.opens) {                     // open what a reviewer needs to see
+      const el = page.locator(sel).first();
+      try {
+        await el.waitFor({ state: 'visible', timeout: 3000 });
+        // idempotent on purpose: a section that is already open must not be toggled shut
+        const expanded = await el.getAttribute('aria-expanded');
+        if (expanded === 'true') continue;
+        await el.click({ timeout: 3000 });
+        await page.waitForTimeout(250);
+      } catch (e) {
+        process.stderr.write(`page-shot: could not open ${sel} (${e.message.split('\n')[0]})\n`);
+      }
+    }
+    if (opts.opens.length) await page.waitForTimeout(opts.wait);
+    if (opts.flatten) {
+      // Sticky/fixed bars composite at the scroll position a full-page capture starts
+      // from, so a header can appear halfway down and read like a real layout bug.
+      // Putting them back in the flow moves each bar to where it belongs in the
+      // document - opt in, because a bar that *should* float then looks odd.
+      const moved = await page.evaluate(() => {
+        let n = 0;
+        document.querySelectorAll('*').forEach((el) => {
+          const pos = getComputedStyle(el).position;
+          if (pos === 'sticky' || pos === 'fixed') {
+            el.style.setProperty('position', 'static', 'important');
+            n += 1;
+          }
+        });
+        return n;
+      });
+      process.stderr.write(`page-shot: --flatten moved ${moved} sticky/fixed element(s) into the flow\n`);
+      await page.waitForTimeout(400);
+    }
+    // back to the top: sticky/fixed bars composite at the scroll position when a
+    // full-page capture starts, and a stray header halfway down confuses a reviewer
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.waitForTimeout(250);
+
+    const shotOpts = { path: opts.out, fullPage: opts.full, caret: 'hide' };
+    try {
+      await page.screenshot(Object.assign({ animations: 'disabled' }, shotOpts));
+    } catch (e) {
+      await page.screenshot(shotOpts);                    // older playwright: no animations
+    }
+    const size = pngSize(opts.out) || { width: 0, height: 0 };
+    emit(opts, {
+      path: path.resolve(opts.out), url: page.url(), full_page: opts.full,
+      viewport: { width: opts.width, height: opts.height }, scale: opts.scale,
+      width: size.width, height: size.height, bytes: fs.statSync(opts.out).size,
+      expected,
+    });
+    if (!expected) {
+      process.stderr.write(`page-shot: ${opts.expect} never appeared on ${opts.url} - the shot may be ` +
+        'a login screen or an error page\n');
+      process.exit(3);
+    }
+  } finally {
+    await browser.close();
+  }
+}
+
+main().catch((e) => {
+  process.stderr.write(`page-shot: ${e.message}\n`);
+  process.exit(2);
+});

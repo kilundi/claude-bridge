@@ -430,6 +430,94 @@ def test_cli_offers_the_flags() -> str:
     return "ask-claude --image/--clear/--composer are real flags (checked with --help)"
 
 
+def test_page_shot_commands_are_built_right() -> str:
+    import mcp_server
+
+    tool = [t for t in mcp_server.TOOLS if t["name"] == "page_shot"][0]
+    assert tool["inputSchema"]["required"] == ["url"], tool["inputSchema"]
+    assert "whole page" in tool["description"], tool["description"]
+
+    argv = mcp_server.page_shot_argv({
+        "url": "http://localhost:5173/items/new", "out": "/tmp/x/s.png",
+        "from_dir": "/repo", "width": 360, "height": 640, "flatten": True,
+        "open": ["[data-testid=\"a\"]"], "expect": "[data-testid=\"page-title\"]",
+        "sign_in": {"path": "/signin",
+                    "fill": {'[data-testid="signin-email"]': "a@b.c"},
+                    "click": "[data-testid=\"signin-submit\"]", "ready": "[data-testid=\"page\"]"},
+    })
+    assert argv[:4] == ["node", mcp_server.PAGE_SHOT, "http://localhost:5173/items/new",
+                        "/tmp/x/s.png"], argv
+    for pair in (("--width", "360"), ("--height", "640"), ("--from", "/repo")):
+        assert list(pair) == argv[argv.index(pair[0]):argv.index(pair[0]) + 2], argv
+    assert "--full" in argv and "--flatten" in argv and "--json" in argv, argv
+    assert argv[argv.index("--open") + 1] == '[data-testid="a"]', argv
+    assert argv[argv.index("--expect") + 1] == '[data-testid="page-title"]', argv
+    assert argv[argv.index("--signin") + 1] == "/signin", argv
+    assert argv[argv.index("--fill") + 1] == '[data-testid="signin-email"]=a@b.c', argv
+
+    # a phone shot of the whole page is the default; --viewport must be asked for
+    plain = mcp_server.page_shot_argv({"url": "http://x/"})
+    assert "--full" in plain and "--flatten" not in plain, plain
+    assert "--viewport" in mcp_server.page_shot_argv({"url": "http://x/", "full_page": False})
+    default_out = plain[3]
+    assert default_out.startswith(mcp_server.SHOTS_DIR) and default_out.endswith(".png"), default_out
+    try:
+        mcp_server.page_shot_argv({})
+        raise AssertionError("a shot without a url was accepted")
+    except ValueError as e:
+        assert "url" in str(e), str(e)
+    return "the MCP call becomes a page-shot command with the phone/whole-page defaults"
+
+
+def test_page_shot_reports_what_happened() -> str:
+    import mcp_server
+    import types
+
+    real_sub, real_shutil = mcp_server.subprocess, mcp_server.shutil
+    mcp_server.shutil = types.SimpleNamespace(which=lambda name: "/usr/bin/" + name)
+    try:
+        class Proc:
+            def __init__(self, rc, out="", err=""):
+                self.returncode, self.stdout, self.stderr = rc, out, err
+
+        shot = {"path": "/tmp/s.png", "width": 780, "height": 5412, "bytes": 292625,
+                "full_page": True, "expected": True, "viewport": {"width": 390, "height": 844}}
+        mcp_server.subprocess = types.SimpleNamespace(
+            run=lambda *a, **k: Proc(0, json.dumps(shot) + "\n",
+                                     "page-shot: --flatten moved 6 sticky/fixed element(s)\n"))
+        res = mcp_server.run_page_shot({"url": "http://x/"})
+        assert res["height"] == 5412 and res["full_page"] is True, res
+        assert "flatten moved 6" in res.get("warnings", ""), res
+
+        resp = mcp_server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                  "params": {"name": "page_shot",
+                                             "arguments": {"url": "http://x/"}}})
+        text = resp["result"]["content"][0]["text"]
+        assert "5412" in text and not resp["result"].get("isError"), resp
+
+        mcp_server.subprocess = types.SimpleNamespace(
+            run=lambda *a, **k: Proc(2, "", "page-shot: the sign-in did not finish: [data-testid=\"page\"] never appeared\n"))
+        try:
+            mcp_server.run_page_shot({"url": "http://x/"})
+            raise AssertionError("a failed shot was reported as success")
+        except RuntimeError as e:
+            assert "sign-in did not finish" in str(e), str(e)
+        resp = mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                  "params": {"name": "page_shot",
+                                             "arguments": {"url": "http://x/"}}})
+        assert resp["result"].get("isError"), resp
+        assert "sign-in did not finish" in resp["result"]["content"][0]["text"], resp
+    finally:
+        mcp_server.subprocess, mcp_server.shutil = real_sub, real_shutil
+
+    # the real script: no arguments is a usage error, not a crash
+    script = os.path.join(ROOT, "page-shot")
+    assert os.path.exists(script), script
+    bad = subprocess.run(["node", script], capture_output=True, text=True, timeout=60)
+    assert bad.returncode == 2 and "usage: page-shot" in bad.stderr, (bad.returncode, bad.stderr)
+    return "a shot's size is reported back, a failure is an error, and the script is valid node"
+
+
 def main() -> int:
     checks = [
         ("--image takes files and dirs", test_paths_take_files_and_dirs),
@@ -447,6 +535,8 @@ def main() -> int:
         ("a plain ask is unchanged", test_a_clean_plain_ask_is_unchanged),
         ("the MCP tool carries images", test_mcp_carries_images),
         ("the CLI offers the flags", test_cli_offers_the_flags),
+        ("page-shot commands are built right", test_page_shot_commands_are_built_right),
+        ("page-shot reports what happened", test_page_shot_reports_what_happened),
     ]
     failed = 0
     try:
