@@ -29,6 +29,7 @@ import watcher  # noqa: E402
 # tmp_env() stubs session_activity so no proof can touch the API by accident; the two
 # proofs ABOUT that reader call the real one through this reference.
 REAL_SESSION_ACTIVITY = watcher.session_activity
+REAL_TURN_IN_FLIGHT = watcher._turn_in_flight
 
 
 def tmp_env(tmp=None) -> str:
@@ -46,6 +47,9 @@ def tmp_env(tmp=None) -> str:
     watcher.open_agent_terminal = lambda cfg_, oid, sid, directory: False
     watcher.session_activity = lambda cfg_, st_, now=None: []
     watcher._close_window = lambda pid, script: None
+    # the transcript probe: "nobody could say", which must always hold a slot.  A proof
+    # that is about it overrides this.
+    watcher._turn_in_flight = lambda binp, sid: None
     return d
 
 
@@ -163,6 +167,139 @@ def test_a_long_suite_keeps_its_slot() -> str:
     return "a 40-minute end-to-end run looks idle but keeps its slot: no third agent"
 
 
+# --- the clock is not evidence: what the transcript says ---------------------------------
+# 2026-11-11 13:44: five sessions held a cap of two and the queue stopped for 35 minutes.
+# Only one of them was working.  A slot lasted an hour after any movement and a
+# restart-resume moved the clock, so four killed agents sat on a full cap.
+
+def test_a_dead_agent_frees_its_slot() -> str:
+    tmp_env()
+    ages = {"WO-320": 2000, "WO-321": 2100, "WO-322": 2200, "WO-323": 2300, "WO-324": 60}
+    st = state(*[(oid, "ses_" + oid.lower(), age) for oid, age in ages.items()])
+    watcher.session_activity = make_activity(ages)
+    probed: list[str] = []
+
+    def probe(a):
+        probed.append(a["order"])
+        return False          # every stale transcript ends in an idle marker: no turn
+
+    act = watcher.session_activity(cfg(), st)
+    assert [a["order"] for a in watcher.live_agents(act)] == ["WO-324"], "only the fresh one is 'working'"
+    assert [a["order"] for a in watcher.slot_agents(act, cfg(), probe=probe)] == ["WO-324"]
+    assert sorted(probed) == ["WO-320", "WO-321", "WO-322", "WO-323"], probed
+    # the pass decisions use it too, so the queue moves without anybody freeing a slot
+    watcher._turn_in_flight = lambda binp, sid: False
+    batch, held = watcher.dispatch_batch(cfg(), st, [order("WO-325")])
+    assert [o["id"] for o in batch] == ["WO-325"] and held == [], (batch, held)
+    return "four stale sessions with no turn running free their slots; the queue moves"
+
+
+def test_a_silent_suite_keeps_its_slot_with_evidence() -> str:
+    tmp_env()
+    st = state(("WO-330", "ses_a", 2400), ("WO-331", "ses_b", 2400))
+    watcher.session_activity = make_activity({"WO-330": 2400, "WO-331": 2400})
+    watcher._turn_in_flight = lambda binp, sid: True      # the tests are running
+    act = watcher.session_activity(cfg(), st)
+    assert len(watcher.slot_agents(act, cfg(), probe=watcher.turn_probe(cfg()))) == 2
+    batch, held = watcher.dispatch_batch(cfg(), st, [order("WO-332")])
+    assert batch == [] and len(held) == 1, (batch, held)
+    return "a silent session with a turn in flight keeps its slot: still no third agent"
+
+
+def test_an_unreadable_probe_never_frees_a_slot() -> str:
+    tmp_env()
+    st = state(("WO-335", "ses_a", 2400))
+    watcher.session_activity = make_activity({"WO-335": 2400})
+    calls: list[str] = []
+
+    def probe(a):
+        calls.append(a["order"])
+        return None           # the API did not answer: unknown is not "idle"
+
+    act = watcher.session_activity(cfg(), st)
+    assert len(watcher.slot_agents(act, cfg(), probe=probe)) == 1
+    assert calls == ["WO-335"], calls
+    return "a probe that cannot answer holds the slot: never free one on a guess"
+
+
+def test_a_fresh_session_is_not_probed() -> str:
+    tmp_env()
+    st = state(("WO-340", "ses_a", 60))
+    watcher.session_activity = make_activity({"WO-340": 60})
+    called: list[str] = []
+
+    def probe(a):
+        called.append(a["order"])
+        return True
+
+    act = watcher.session_activity(cfg(), st)
+    assert [a["order"] for a in watcher.slot_agents(act, cfg(), probe=probe)] == ["WO-340"]
+    assert called == [], "a session that just moved is working: no request needed"
+    # and once it goes quiet, the probe is what decides
+    act2 = make_activity({"WO-340": 3000})(cfg(), st)
+    assert [a["order"] for a in watcher.slot_agents(act2, cfg(), probe=probe)] == ["WO-340"]
+    assert called == ["WO-340"], called
+    assert act2[0].get("in_turn") is True, "the answer is kept on the activity for status"
+    return "the probe is only asked about a session the clock cannot vouch for"
+
+
+def test_a_resume_that_did_not_take_frees_its_slot() -> str:
+    """2026-11-11 13:44 in miniature: resumes whose turns died within seconds.
+
+    The resume moved the clock, so a slot lasted an hour and the queue stopped for 35
+    minutes behind five sessions of which one was working.  What decides is whether a
+    turn is running now, not who touched the session last.
+    """
+    tmp_env()
+    st = state(("WO-360", "ses_a", 1200), ("WO-361", "ses_b", 1300))
+    st["resume"] = {"WO-360": {"count": 2, "at": time.time() - 1200},
+                    "WO-361": {"count": 2, "at": time.time() - 1300}}
+    watcher.session_activity = make_activity({"WO-360": 1200, "WO-361": 1300})
+    watcher._turn_in_flight = lambda binp, sid: False     # each resumed turn ended
+    act = watcher.session_activity(cfg(), st)
+    assert watcher.slot_agents(act, cfg(), probe=watcher.turn_probe(cfg())) == []
+    batch, held = watcher.dispatch_batch(cfg(), st, [order("WO-362")])
+    assert [o["id"] for o in batch] == ["WO-362"] and held == [], (batch, held)
+    return "a resume whose turn died frees its slot: the clock it moved is not work"
+
+
+def test_the_race_guard_holds_before_asking() -> str:
+    """A prompt just accepted must not lose its slot to a transcript that lags behind."""
+    tmp_env()
+    st = state(("WO-365", "ses_a", 5))
+    watcher.session_activity = make_activity({"WO-365": 5})
+    called: list[str] = []
+
+    def probe(a):
+        called.append(a["order"])
+        return False            # the transcript has not caught up with the prompt yet
+
+    act = watcher.session_activity(cfg(), st)
+    assert [a["order"] for a in watcher.slot_agents(act, cfg(), probe=probe,
+                                                    now=time.time())] == ["WO-365"]
+    assert called == [], "inside the grace period the clock is trusted, not the page"
+    return "a session that moved seconds ago keeps its slot: the transcript can lag"
+
+
+def test_a_started_order_drops_its_held_marker() -> str:
+    tmp_env()
+    st = state()
+    st["held"] = {"WO-350": time.time()}
+    started: list[str] = []
+    watcher.start_agent = lambda c, o, f, i: (started.append(o["id"]) or "ses_new")
+    watcher.handle_orders(cfg(), st, [order("WO-350")], files=[])
+    assert started == ["WO-350"], started
+    assert "WO-350" not in st["held"], st["held"]
+    # and the status never calls a started order one that is still waiting
+    st["held"]["WO-351"] = time.time()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        watcher.report_status(cfg(), st)
+    assert "WO-351  waiting for a free agent slot" in buf.getvalue(), buf.getvalue()
+    assert "WO-350  waiting" not in buf.getvalue(), buf.getvalue()
+    return "starting an order clears its held marker, and status stops contradicting itself"
+
+
 # --- noticing the server die, and bringing it back -------------------------------------
 
 def test_service_restart_is_noticed_across_a_watcher_restart() -> str:
@@ -237,6 +374,33 @@ def test_liveness_reads_one_small_record_not_the_transcript() -> str:
     act = REAL_SESSION_ACTIVITY(cfg(), st)
     assert act[0]["last"] is None and act[0]["live"] is False, act
     return "one small record per agent, so a 261 KB message page cannot blind us mid-way"
+
+
+def test_the_probe_asks_once_and_only_for_the_tail() -> str:
+    """The probe is one 355-byte request per session, and never the whole page."""
+    tmp_env()
+    calls: list[str] = []
+
+    def fake(binp, method, path, payload=None, timeout=60):
+        calls.append(path)
+        if "limit=1" not in path:
+            raise AssertionError("the probe asked for more than one message: %s" % path)
+        return {"data": [{"type": "idle"}]}
+
+    watcher._PROBE_MEMO.clear()
+    watcher.oc_api = fake
+    assert REAL_TURN_IN_FLIGHT("bin", "ses_a") is False
+    assert REAL_TURN_IN_FLIGHT("bin", "ses_a") is False          # a second pass in one go
+    assert calls == ["/api/session/ses_a/message?limit=1"], calls
+    # an idle marker means no turn; anything else is a turn
+    watcher.oc_api = lambda *a, **k: {"data": [{"type": "assistant"}]}
+    watcher._PROBE_MEMO.clear()
+    assert REAL_TURN_IN_FLIGHT("bin", "ses_b") is True
+    # and a truncated page (the CLI's habit on a big session) is unknown, never idle
+    watcher._PROBE_MEMO.clear()
+    watcher.oc_api = lambda *a, **k: {"raw": '{"data":[{"id":"msg_1","time":{"crea'}
+    assert REAL_TURN_IN_FLIGHT("bin", "ses_c") is None
+    return "one small request per session per few seconds, and a bad answer is 'unknown'"
 
 
 def test_an_unreadable_record_is_never_idle() -> str:
@@ -370,7 +534,7 @@ def test_status_says_what_is_running() -> str:
     with contextlib.redirect_stdout(buf):
         watcher.report_status(cfg(), st)
     out = buf.getvalue()
-    assert "1 working, 2 holding a slot (max_agents=2)" in out, out
+    assert "1 working, 1 quiet but holding a slot (max_agents=2)" in out, out
     assert "WO-380  working" in out and "WO-381  slot" in out, out
     assert "WO-382  waiting for a free agent slot" in out, out
     assert "WO-381  resumed 3 time(s) - have a look at it" in out, out
@@ -382,10 +546,18 @@ def main() -> int:
         ("a cap holds the third agent", test_slot_cap_holds_the_third),
         ("a finished order frees its slot", test_cap_frees_a_slot_when_one_finishes),
         ("a long suite keeps its slot", test_a_long_suite_keeps_its_slot),
+        ("a dead agent frees its slot", test_a_dead_agent_frees_its_slot),
+        ("a silent suite keeps its slot", test_a_silent_suite_keeps_its_slot_with_evidence),
+        ("an unreadable probe holds", test_an_unreadable_probe_never_frees_a_slot),
+        ("a fresh session is not probed", test_a_fresh_session_is_not_probed),
+        ("a started order drops its held mark", test_a_started_order_drops_its_held_marker),
+        ("a resume that died frees its slot", test_a_resume_that_did_not_take_frees_its_slot),
+        ("the race guard holds", test_the_race_guard_holds_before_asking),
         ("a restarted server is noticed", test_service_restart_is_noticed_across_a_watcher_restart),
         ("a dead server is started once", test_ensure_service_only_touches_a_dead_server),
         ("liveness comes from the record", test_activity_reads_the_record),
         ("one small record, not the page", test_liveness_reads_one_small_record_not_the_transcript),
+        ("the probe asks once, small", test_the_probe_asks_once_and_only_for_the_tail),
         ("an unreadable record is unknown", test_an_unreadable_record_is_never_idle),
         ("resume needs a restart", test_resume_only_after_a_restart),
         ("resume is bounded", test_resume_is_bounded),

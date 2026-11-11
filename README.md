@@ -317,7 +317,7 @@ it exists, and nothing is sent to Claude a second time. Knobs, all under `watch`
 | `ask_grace_seconds` | `600` | how long to give Claude to answer the ask before going loud |
 | `ask_min_seconds` | `120` | never two asks closer together than this |
 | `ask_timeout` | `180` | how long the watcher waits for the reply to its ask (the reply is read on a later pass anyway) |
-| `agent_active_seconds` | `1800` | an agent counts as "still working" if its transcript moved within this window; while one is working the watcher holds its ask rather than stack a second agent on the same repo |
+| `agent_active_seconds` | `1800` | an agent counts as "still working" (and the watcher holds its ask rather than stack a second agent on the same repo) if its transcript moved within this window |
 
 ### Files, and "save this to that directory"
 
@@ -488,10 +488,18 @@ The loop now expects this and deals with it:
 
 * **Agents are capped (`max_agents`, default 2).** An order over the cap is left completely
   unmarked and picked up by a later pass, so nothing is dropped: it is merely the queue
-  working. An agent holds its slot for `slot_seconds` (an hour) after its last sign of life,
-  because the full web end-to-end suite is 48.8 minutes of silence and looks idle to any
-  recency check - stacking a third agent on top of that is exactly how the box ran out of
-  memory. `watcher.sh done <id>` frees a slot the moment a report lands.
+  working. A slot belongs to a *running* agent, which a timestamp cannot tell you - the full
+  web end-to-end suite is 48.8 minutes of silence and a turn killed with the background
+  server is silent too, and they want opposite things. So a session quiet for less than
+  `slot_probe_seconds` (2 min) is trusted to be working (that window is the race guard: a
+  prompt has been accepted but its turn has not appeared yet); past it the watcher asks the
+  session's own transcript whether a turn is running - the newest entry is an `idle` marker
+  once a turn has ended, one 355-byte request - and frees the slot the moment it has ended.
+  `slot_seconds` (an hour) is the backstop for a probe that cannot answer, never the normal
+  rule, and `watcher.sh done <id>` frees a slot the moment a report lands.
+  This is not theory: on 2026-11-11 five sessions held a cap of two for 35 minutes, because
+  a restart-resume moved each clock and the old rule counted a clock. One of them was
+  working.
 * **The server comes back once, not in a stampede.** The watcher is the single owner: if the
   registered pid is gone it runs `opencode service start` itself (at most once a minute),
   and it never touches a live server.
@@ -519,7 +527,8 @@ agent is thinking"*, so telling it frees an agent slot now instead of two hours 
 | setting | default | meaning |
 |---|---|---|
 | `max_agents` | `2` | how many agents may run at once; `0` = no cap |
-| `slot_seconds` | `3600` | how long an agent keeps its slot after its last sign of life |
+| `slot_seconds` | `3600` | the backstop: a slot is freed after this even if a turn seems to be running |
+| `slot_probe_seconds` | `120` | quiet for less than this, a session keeps its slot without being asked |
 | `service_start_cooldown` | `60` | at most one `opencode service start` this often |
 | `resume_interrupted` | `true` | resume the turns a server restart interrupted |
 | `resume_max` | `3` | how many times one order may be resumed before it is left for a human |

@@ -398,6 +398,45 @@ def _moved_at(binp: str, sid: str) -> float | None:
     return None
 
 
+# A slot belongs to a running agent, and the only honest way to know is to look at the
+# session's transcript.  The answers are kept for a few seconds: one pass asks about the
+# same sessions more than once, and a hung API would charge its full timeout each time.
+_PROBE_MEMO: dict[str, tuple[float, bool | None]] = {}
+
+
+def _turn_in_flight(binp: str, sid: str, ttl: float = 15.0) -> bool | None:
+    """Whether a turn is running in this session *right now*.
+
+    A timestamp cannot answer it: a row of end-to-end tests is silent for 48 minutes
+    and a turn killed with the background server is silent too, and the two want
+    opposite things.  The transcript itself can: its newest entry is an ``idle``
+    marker once a turn has ended, so a newest entry that is anything else means work
+    is in progress.
+
+    ``limit=1`` keeps that answer to a few hundred bytes.  The whole page is ~400 KB
+    and the CLI truncates it mid-JSON, which would read as "unknown" exactly when the
+    longest session has the most work behind it.  ``None`` means it could not be read,
+    and callers must hold the slot then - never free one on a guess.
+
+    Cached for ``ttl`` seconds: a single pass asks about the same sessions two or three
+    times, and when the API hangs each ask costs its full timeout.
+    """
+    hit = _PROBE_MEMO.get(sid)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    answer: bool | None
+    try:
+        page = oc_api(binp, "GET", "/api/session/%s/message?limit=1" % sid, timeout=20)
+    except Exception:
+        answer = None
+    else:
+        items = page.get("data") if isinstance(page, dict) else page
+        answer = None if not isinstance(items, list) or not items else \
+            (items[0] or {}).get("type") != "idle"
+    _PROBE_MEMO[sid] = (time.time(), answer)
+    return answer
+
+
 def session_activity(cfg: dict, st: dict, now: float | None = None) -> list[dict]:
     """When each agent last moved: [{"order","session","last","live"}].
 
@@ -428,18 +467,55 @@ def live_agents(activity: list[dict]) -> list[dict]:
     return [a for a in activity if a.get("live")]
 
 
-def slot_agents(activity: list[dict], cfg: dict, now: float | None = None) -> list[dict]:
+def slot_agents(activity: list[dict], cfg: dict, now: float | None = None,
+                probe=None) -> list[dict]:
     """The agents holding one of the ``max_agents`` slots.
 
-    A slot is held for ``slot_seconds`` (an hour by default), not just
-    ``agent_active_seconds``: the full web end-to-end suite takes 48.8 minutes of
-    silence, it looks dead to any recency check, and stacking a third agent on top of
-    that is how the box ran out of memory.  ``watcher.sh done <id>`` frees a slot at
-    once, which is what a DONE report should mean.
+    A slot belongs to a *running* agent, not a recently touched one, and a timestamp
+    cannot tell the difference: a row of end-to-end tests is silent for 48.8 minutes and
+    a turn killed with the background server is silent too - and they want opposite
+    things.  So the clock only decides *when* to ask:
+
+    * quiet for less than ``slot_probe_seconds`` (2 min) - hold, no question asked.  That
+      is the race guard: the window in which a prompt (a start, a resume, a new message
+      from the user) has been accepted but its turn has not appeared yet.
+    * quiet for longer - ask ``probe`` whether a turn is running
+      (:func:`_turn_in_flight`).  Hold while one is, and free the slot the moment it has
+      ended, which is what an agent waiting for input deserves.  Note that a *resume is
+      not work*: it moved the clock, so the old rule held the slot for an hour even when
+      the resumed turn died in five seconds, and the queue stopped behind it.
+    * past ``slot_seconds`` (an hour) - freed without asking.  The backstop for a probe
+      that cannot answer, not the normal rule.
+
+    ``watcher.sh done <id>`` frees a slot at once, which is what a DONE report means.
     """
     now = now or time.time()
-    window = float((cfg.get("watch") or {}).get("slot_seconds", 3600))
-    return [a for a in activity if a.get("last") is not None and now - a["last"] < window]
+    w = cfg.get("watch") or {}
+    hold = float(w.get("slot_seconds", 3600))
+    grace = float(w.get("slot_probe_seconds", 120))
+    out: list[dict] = []
+    for a in activity:
+        last = a.get("last")
+        if last is None:              # unreadable: never counted, as it never was
+            continue
+        age = now - last
+        if age >= hold:
+            continue
+        if age < grace:               # just moved, or just poked: never guess here
+            out.append(a)
+            continue
+        in_turn = probe(a) if probe else None
+        a["in_turn"] = in_turn
+        if in_turn is not False:      # running, or nobody could say: hold, never guess
+            out.append(a)
+    return out
+
+
+def turn_probe(cfg: dict):
+    """A ``probe`` for :func:`slot_agents`: is a turn running in this session?"""
+    binp = os.path.expanduser((cfg.get("watch") or {}).get("opencode_bin")
+                              or "~/.opencode/bin/opencode")
+    return lambda a: _turn_in_flight(binp, a.get("session") or "")
 
 
 def agent_busy(cfg: dict, st: dict, now: float | None = None) -> dict:
@@ -542,7 +618,7 @@ def dispatch_batch(cfg: dict, st: dict, orders: list[dict], dry_run: bool = Fals
     if cap <= 0 or dry_run or not orders:
         return list(orders), []
     act = activity if activity is not None else session_activity(cfg, st)
-    working = slot_agents(act, cfg)
+    working = slot_agents(act, cfg, probe=turn_probe(cfg))
     room = max(0, cap - len(working))
     holds = st.setdefault("held", {})
     for o in orders[:room]:
@@ -1113,6 +1189,7 @@ def handle_orders(cfg: dict, st: dict, orders: list[dict], files: list[dict] | N
         log("new work order %s -> %s" % (o["id"], inbox_path))
         seen[o["id"]] = _hash(o["raw"])
         st["orders"] = seen
+        (st.get("held") or {}).pop(o["id"], None)   # it is starting: the wait is over
         rec = st.setdefault("starts", {}).setdefault(o["id"], {"status": "pending", "attempts": 0})
         rec.update({"order": o, "inbox": inbox_path, "files": files, "updated": time.time()})
         # a dispatched order is progress: the turn is alive again, so any ask
@@ -1277,10 +1354,12 @@ def report_status(cfg: dict, st: dict) -> int:
     w = cfg.get("watch") or {}
     cap = int(w.get("max_agents") or 0)
     act = session_activity(cfg, st)
-    slots = {a["order"] for a in slot_agents(act, cfg)}
+    slots = {a["order"] for a in slot_agents(act, cfg, probe=turn_probe(cfg))}
+    live = live_agents(act)
+    quiet_held = slots - {a["order"] for a in live}
     done = set(st.get("finished") or {})
-    print("agents: %d working, %d holding a slot (max_agents=%s)"
-          % (len(live_agents(act)), len(slots), cap or "none"))
+    print("agents: %d working, %d quiet but holding a slot (max_agents=%s)"
+          % (len(live), len(quiet_held), cap or "none"))
     for a in act:
         if a["order"] in done:
             state = "finished"
@@ -1297,6 +1376,8 @@ def report_status(cfg: dict, st: dict) -> int:
         print("  %-7s resumed %d time(s)%s"
               % (oid, n, " - have a look at it" if n >= int(w.get("resume_max", 3)) else ""))
     for oid in sorted((st.get("held") or {}).keys()):
+        if oid in (st.get("starts") or {}):
+            continue          # it started after all: a stale marker, not a wait
         print("  %-7s waiting for a free agent slot" % oid)
     return 0
 
