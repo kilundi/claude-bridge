@@ -55,6 +55,7 @@ def tmp_env() -> str:
     watcher.INBOX = os.path.join(d, "inbox")
     watcher.LOG = os.path.join(d, "watcher.log")
     watcher.DOWNLOADS = os.path.join(d, "downloads")
+    watcher.REPORTS = os.path.join(d, "reports")
     watcher.NEEDS_ORDER = os.path.join(d, "NEEDS-ORDER.md")
     os.makedirs(watcher.INBOX, exist_ok=True)
     os.makedirs(watcher.DOWNLOADS, exist_ok=True)
@@ -277,6 +278,8 @@ def test_missing_file_reaches_the_agent() -> str:
     path = watcher.order_to_inbox(order, [])
     body = open(path).read()
     assert "could not download" in body and "agent-prompt-99-brief.md" in body, body
+    assert os.path.isdir(watcher.REPORTS), "the report drop is promised, so it must exist"
+    assert watcher.report_file(order["id"]) in body, body
     prompt = watcher.build_prompt(order, [], path)
     assert "could NOT download" in prompt and "agent-prompt-99-brief.md" in prompt, prompt
     return "the inbox file and the agent prompt both carry the fallback path"

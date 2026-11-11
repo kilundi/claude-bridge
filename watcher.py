@@ -918,6 +918,9 @@ def write_needs_order(st: dict, why: str, detail: str, snippet: str = "") -> Non
 
 def order_to_inbox(order: dict, files: list[dict]) -> str:
     os.makedirs(INBOX, exist_ok=True)
+    # the order promises the agent a place to leave its report, so make it real before
+    # the agent runs: an agent whose write has nowhere to go cannot free its own slot
+    os.makedirs(REPORTS, exist_ok=True)
     body = ["# Work order %s" % order["id"], ""]
     if order.get("dir"):
         body.append("dir: %s" % order["dir"])
