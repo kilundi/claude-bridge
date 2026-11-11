@@ -125,6 +125,13 @@ def save_state(st: dict) -> None:
     a per-process temp file and ``os.replace``.
     """
     merged = _merge(load_state(), st)
+    # `held` is the one map whose *absences* carry meaning.  Its owner recomputes it from
+    # the transcript every pass - a wait that is over, an order that has just started,
+    # one the chat has scrolled past - and a union with the file would resurrect exactly
+    # those: `watcher.sh done WO-116` popped the marker and the next save put it back, so
+    # a finished order kept showing as waiting for a slot.  Everything else merges, so a
+    # second process's marks are never reverted.
+    merged["held"] = dict(st.get("held") or {})
     _apply_inplace(st, merged)
     tmp = "%s.%d.tmp" % (STATE, os.getpid())
     with open(tmp, "w") as fh:
@@ -604,6 +611,24 @@ def resume_stalled(cfg: dict, st: dict, activity: list[dict], restarted: dict | 
         quiet(st, "%d more interrupted order(s) - the rest resume on a later pass"
               % (len(cands) - len(out)))
     return out
+
+
+def prune_held(st: dict, orders: list[dict]) -> list[str]:
+    """Drop held markers that are no longer a real wait.
+
+    Two kinds go: an order that is no longer in the chat's transcript (a held order is
+    deliberately left unmarked in ``orders`` so a later pass can still start it, but one
+    that has scrolled out will never be read again, and ``status`` showing it would be a
+    lie about the queue), and one that has since been marked finished.  Only markers for
+    orders read *this* pass and still open survive.
+    """
+    holds = st.setdefault("held", {})
+    here = {o["id"] for o in orders}
+    done = set(st.get("finished") or {})
+    gone = [oid for oid in list(holds) if oid not in here or oid in done]
+    for oid in gone:
+        holds.pop(oid, None)
+    return gone
 
 
 def dispatch_batch(cfg: dict, st: dict, orders: list[dict], dry_run: bool = False,
@@ -1295,6 +1320,8 @@ def pass_once(cfg: dict, st: dict, dry_run: bool = False) -> dict:
         orders.extend(extract_work_orders(m))
     routed = route_orders(st, orders)
     new = routed["dispatch"]
+    for gone in prune_held(st, orders):
+        log("%s is no longer in the chat - it is not waiting for a slot any more" % gone)
 
     # Only the orders that fit under max_agents have their files pulled down now; a
     # held one is fetched when it starts, so a loaded machine does not do that work

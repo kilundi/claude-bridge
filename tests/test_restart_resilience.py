@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import sys
 import tempfile
@@ -290,6 +291,8 @@ def test_a_started_order_drops_its_held_marker() -> str:
     watcher.handle_orders(cfg(), st, [order("WO-350")], files=[])
     assert started == ["WO-350"], started
     assert "WO-350" not in st["held"], st["held"]
+    # and the file agrees: a save must not put the marker back out of the merge
+    assert "WO-350" not in (json.load(open(watcher.STATE)).get("held") or {})
     # and the status never calls a started order one that is still waiting
     st["held"]["WO-351"] = time.time()
     buf = io.StringIO()
@@ -524,6 +527,48 @@ def test_reap_closes_quiet_windows_only() -> str:
 
 # --- watcher.sh status -----------------------------------------------------------------
 
+def test_a_stale_wait_is_not_reported_as_waiting() -> str:
+    """An order the chat has moved past, or one already finished, is not "waiting"."""
+    tmp_env()
+    st = state()
+    st["held"] = {"WO-390": time.time(), "WO-391": time.time(), "WO-392": time.time()}
+    st["finished"] = {"WO-392": time.time()}
+    # this pass read WO-391 only: WO-390 has scrolled out, WO-392 is already finished
+    gone = watcher.prune_held(st, [order("WO-391")])
+    assert gone == ["WO-390", "WO-392"], gone
+    assert sorted(st["held"]) == ["WO-391"], st["held"]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        watcher.report_status(cfg(), st)
+    assert "WO-391  waiting for a free agent slot" in buf.getvalue(), buf.getvalue()
+    assert "WO-390" not in buf.getvalue() and "WO-392" not in buf.getvalue(), buf.getvalue()
+    return "a wait the chat has moved past is dropped, so the queue in status is real"
+
+
+def test_a_removal_survives_the_save() -> str:
+    """The save merges other processes' marks, and still lets a wait be pruned.
+
+    It used to union every key, so a removal came straight back out of the file: the
+    marker ``watcher.sh done`` popped was written again by the very next pass, and a
+    finished order kept reading as one that was waiting for a slot.
+    """
+    tmp_env()
+    st = state()
+    st["held"] = {"WO-370": time.time(), "WO-371": time.time()}
+    st["orders"] = {"WO-370": "h1"}
+    watcher.save_state(st)
+    # another process pops one wait, and marks an order its own reading found
+    other = watcher.load_state()
+    other["held"].pop("WO-370")
+    other["orders"]["WO-372"] = "h2"
+    watcher.save_state(other)
+    on_disk = json.load(open(watcher.STATE))
+    assert "WO-370" not in on_disk["held"], on_disk["held"]
+    assert "WO-371" in on_disk["held"], on_disk["held"]
+    assert on_disk["orders"].get("WO-372") == "h2", on_disk["orders"]
+    return "a pruned wait stays pruned, and another process's marks are never reverted"
+
+
 def test_status_says_what_is_running() -> str:
     tmp_env()
     st = state(("WO-380", "ses_a", 60), ("WO-381", "ses_b", 3000), ("WO-383", "ses_c", 1200))
@@ -556,6 +601,8 @@ def main() -> int:
         ("a started order drops its held mark", test_a_started_order_drops_its_held_marker),
         ("a resume that died frees its slot", test_a_resume_that_did_not_take_frees_its_slot),
         ("the race guard holds", test_the_race_guard_holds_before_asking),
+        ("a stale wait is dropped", test_a_stale_wait_is_not_reported_as_waiting),
+        ("a removal survives the save", test_a_removal_survives_the_save),
         ("a restarted server is noticed", test_service_restart_is_noticed_across_a_watcher_restart),
         ("a dead server is started once", test_ensure_service_only_touches_a_dead_server),
         ("liveness comes from the record", test_activity_reads_the_record),
