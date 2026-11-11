@@ -551,7 +551,9 @@ The loop now expects this and deals with it:
   every agent that ever ran.
 * **The views left behind are closed.** An idle agent's TUI costs 150-250 MB for nothing.
   `watcher.sh reap` closes every agent view that is not working; on its own the watcher
-  closes one once its agent has been quiet for `reap_idle_seconds` (2 h). A tab is closed
+  closes one once its agent has been quiet for `reap_idle_seconds` (2 h) **and** the view
+  itself is that old — so a tab you have just launched on an agent that finished hours ago
+  stays, which is the whole point of launching it. A tab is closed
   through its tmux session, which kills the agent's TUI with it, and the last tab takes the
   repository's window with it. That also reaches the tabs whose window was closed by hand:
   nobody is looking at them, but the same session is still running them. A working agent's
@@ -579,7 +581,7 @@ DONE (see "The report that frees its own slot" above).
 | `resume_max_per_pass` | `2` | how many orders may be resumed in one pass |
 | `resume_cooldown_seconds` | `1800` | never resume the same order twice inside this |
 | `resume_max_age_seconds` | `21600` | a session quiet longer than this is over, not interrupted |
-| `reap_idle_seconds` | `7200` | close an agent's view (its tab, or its window) after this long of quiet |
+| `reap_idle_seconds` | `7200` | close an agent's view (its tab, or its window) once its agent has been quiet this long *and* the view is this old |
 | `agent_active_seconds` | `1800` | the transcript moving inside this window means "working" |
 
 If you would rather systemd owned the server than the watcher, `contrib/opencode.service`

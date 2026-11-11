@@ -1364,7 +1364,10 @@ def reap_windows(cfg: dict, st: dict, activity: list[dict] | None = None,
             continue                        # it is working: never close its view
         age = now - os.path.getmtime(win["script"]) if os.path.exists(win["script"]) else 0
         idle = (now - a["last"]) if a.get("last") else 0
-        if not force and age < idle_after and idle < idle_after:
+        # a view goes once it is old *and* its agent is quiet.  Either one alone is not
+        # enough: "launch me the tab that did WO-130" brings back an agent that may have
+        # been quiet for hours, and closing that tab 30 seconds later helps nobody.
+        if not force and (age < idle_after or idle < idle_after):
             continue
         how = ("you asked" if force
                else "quiet for over %d min" % int(idle_after // 60))

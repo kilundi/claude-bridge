@@ -541,6 +541,30 @@ def test_reap_closes_quiet_windows_only() -> str:
 
 # --- a turn parked on a person ---------------------------------------------------------
 
+def test_a_view_just_launched_for_an_old_agent_is_kept() -> str:
+    """`launch me the tab that did WO-130`: the tab a person asks for must survive.
+
+    That agent's transcript may have been quiet for hours, but the view itself is seconds
+    old and somebody wants to talk to it.  Closing a view needs both: an old view and a
+    quiet agent.
+    """
+    d = tmp_env()
+    st = state(("WO-365", "ses_a", 9000))
+    act = make_activity({"WO-365": 9000})(cfg(), st)
+    p = os.path.join(d, "ses_a.sh")
+    with open(p, "w") as fh:
+        fh.write("#!/bin/sh\n")                 # fresh, exactly as a launched tab is
+    killed: list[int] = []
+    watcher._close_window = lambda pid, script: killed.append(pid)
+    wins = [{"pid": 111, "sid": "ses_a", "script": p, "tmux": None}]
+    assert watcher.reap_windows(cfg(), st, act, windows=wins) == []
+    assert killed == [], "the tab a person just asked for was closed under them"
+    os.utime(p, (time.time() - 9000,) * 2)      # now the view is old too
+    assert watcher.reap_windows(cfg(), st, act, windows=wins) == ["WO-365"]
+    assert killed == [111], killed
+    return "a view just launched for a long-quiet agent is kept; an old, quiet one goes"
+
+
 def test_a_parked_turn_frees_its_slot() -> str:
     """WO-113 in miniature: a question waiting on an answer must not hold the queue.
 
@@ -783,6 +807,7 @@ def main() -> int:
         ("resume takes the freshest first", test_resume_takes_the_freshest_first),
         ("a stale session is left alone", test_resume_too_old_is_left_alone),
         ("reaping closes quiet windows only", test_reap_closes_quiet_windows_only),
+        ("a launched tab is kept", test_a_view_just_launched_for_an_old_agent_is_kept),
         ("a parked turn frees its slot", test_a_parked_turn_frees_its_slot),
         ("a finished order holds no slot", test_a_finished_order_holds_no_slot),
         ("a parked window stays, no resume", test_a_parked_window_is_neither_reaped_nor_resumed),
