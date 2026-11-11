@@ -410,9 +410,10 @@ The loop now expects this and deals with it:
 
 * **Agents are capped (`max_agents`, default 2).** An order over the cap is left completely
   unmarked and picked up by a later pass, so nothing is dropped: it is merely the queue
-  working. An agent holds its slot for `slot_seconds` after its last sign of life, because a
-  48 minute end-to-end suite looks idle to any recency check - stacking a third agent on top
-  of that is exactly how the box ran out of memory.
+  working. An agent holds its slot for `slot_seconds` (an hour) after its last sign of life,
+  because the full web end-to-end suite is 48.8 minutes of silence and looks idle to any
+  recency check - stacking a third agent on top of that is exactly how the box ran out of
+  memory. `watcher.sh done <id>` frees a slot the moment a report lands.
 * **The server comes back once, not in a stampede.** The watcher is the single owner: if the
   registered pid is gone it runs `opencode service start` itself (at most once a minute),
   and it never touches a live server.
@@ -440,7 +441,7 @@ agent is thinking"*, so telling it frees an agent slot now instead of two hours 
 | setting | default | meaning |
 |---|---|---|
 | `max_agents` | `2` | how many agents may run at once; `0` = no cap |
-| `slot_seconds` | `7200` | how long an agent keeps its slot after its last sign of life |
+| `slot_seconds` | `3600` | how long an agent keeps its slot after its last sign of life |
 | `service_start_cooldown` | `60` | at most one `opencode service start` this often |
 | `resume_interrupted` | `true` | resume the turns a server restart interrupted |
 | `resume_max` | `3` | how many times one order may be resumed before it is left for a human |

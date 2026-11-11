@@ -431,13 +431,14 @@ def live_agents(activity: list[dict]) -> list[dict]:
 def slot_agents(activity: list[dict], cfg: dict, now: float | None = None) -> list[dict]:
     """The agents holding one of the ``max_agents`` slots.
 
-    A slot is held for ``slot_seconds`` (2 h by default), not just
-    ``agent_active_seconds``: a 48 minute end-to-end suite looks dead to any recency
-    check, and stacking a third agent on top of that is how the box ran out of memory
-    in the first place.
+    A slot is held for ``slot_seconds`` (an hour by default), not just
+    ``agent_active_seconds``: the full web end-to-end suite takes 48.8 minutes of
+    silence, it looks dead to any recency check, and stacking a third agent on top of
+    that is how the box ran out of memory.  ``watcher.sh done <id>`` frees a slot at
+    once, which is what a DONE report should mean.
     """
     now = now or time.time()
-    window = float((cfg.get("watch") or {}).get("slot_seconds", 7200))
+    window = float((cfg.get("watch") or {}).get("slot_seconds", 3600))
     return [a for a in activity if a.get("last") is not None and now - a["last"] < window]
 
 
