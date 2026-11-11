@@ -217,6 +217,22 @@ If Claude cannot answer (the free plan's limit), `ask_claude` returns
 see "When Claude cannot answer" above. Do not resend it: check with
 `claude_availability`, or continue with `wait_for_claude`.
 
+### The report that frees its own slot
+
+A report goes to the planner, not to the watcher, so the watcher cannot watch one land —
+and an order whose agent had finished used to keep its agent slot until a person noticed.
+Two signals settle it without asking anybody:
+
+* **the report file.** Every new order asks its agent to save the same report to
+  `~/claude-bridge/reports/<ORDER-ID>.md`; the file stays there, so the reports are also a
+  readable record of what each order did.
+* **the report itself**, found in the agent's own transcript — the newest two entries, and
+  only what the agent *typed*: a tool's *output* would match every time an agent read this
+  AGENTS.md template, and that is not a report.
+
+Either one marks the order finished: its slot is free at once, it is never resumed, and
+`watcher.sh status` shows it as finished.
+
 ---
 
 ## Claude hands work back: the work-order queue
@@ -494,9 +510,16 @@ The loop now expects this and deals with it:
   `slot_probe_seconds` (2 min) is trusted to be working (that window is the race guard: a
   prompt has been accepted but its turn has not appeared yet); past it the watcher asks the
   session's own transcript whether a turn is running - the newest entry is an `idle` marker
-  once a turn has ended, one 355-byte request - and frees the slot the moment it has ended.
+  once a turn has ended, one 355-byte request - and frees the slot the moment it has ended
+  *or parked itself on a human question*. A turn waiting on the `question` tool (or on a
+  permission prompt) keeps its part `running`, so the clock cannot tell it from work: it is
+  alive, but nothing is computing, and the queue must not stop behind it - WO-113 held a
+  slot for ten minutes that way while 3 GB of RAM sat spare. A parked order keeps its
+  window (that is where the answer goes), is never resumed, and `status` calls it
+  **waiting for you**.
   `slot_seconds` (an hour) is the backstop for a probe that cannot answer, never the normal
-  rule, and `watcher.sh done <id>` frees a slot the moment a report lands.
+  rule, and a slot is freed the moment an agent reports DONE (or `watcher.sh done <id>`
+  says so by hand).
   This is not theory: on 2026-11-11 five sessions held a cap of two for 35 minutes, because
   a restart-resume moved each clock and the old rule counted a clock. One of them was
   working.
@@ -507,7 +530,8 @@ The loop now expects this and deals with it:
   the watcher re-prompt the agents that were stopped: *"your previous turn was interrupted
   ... `git status && git log` first ... do NOT redo committed work ... carry on, then report
   DONE"*. It never interrupts an agent that is working, never touches an order you have
-  marked finished, and is bounded to `resume_max` per order with one per
+  marked finished, never re-prompts one whose agent is parked on a question (the person
+  will answer it), and is bounded to `resume_max` per order with one per
   `resume_cooldown_seconds`, `resume_max_per_pass` at a time - a reboot must not fire up
   every agent that ever ran.
 * **The windows left behind are closed.** An idle agent's window costs 150-250 MB for
@@ -516,13 +540,15 @@ The loop now expects this and deals with it:
   agent's window is never closed, and neither is any window the watcher did not open.
 
 ```bash
-~/claude-bridge/watcher.sh status        # what is running: working / slot / waiting / resumed
+~/claude-bridge/watcher.sh status        # what is running: working / idle / waiting for you / resumed
 ~/claude-bridge/watcher.sh reap          # close the windows of agents that are not working
 ~/claude-bridge/watcher.sh done WO-111   # it reported DONE: free its slot, stop resuming it
 ```
 
-`done` is worth using: nothing in the loop can tell *"the agent reported DONE"* from *"the
-agent is thinking"*, so telling it frees an agent slot now instead of two hours from now.
+`status` also says **waiting for you** for an agent that has parked a question and is holding
+no slot. `done` is the override for the times neither report signal fires - an agent that
+stopped without saying so; the watcher frees the slot by itself the moment an agent reports
+DONE (see "The report that frees its own slot" above).
 
 | setting | default | meaning |
 |---|---|---|
@@ -645,6 +671,7 @@ How the bridge handles it:
 | `downloads/` | file cards fetched from the chat |
 | `drafts/` | the text of a draft `--clear` had to empty out of the composer (never sent, never lost) |
 | `shots/` | screenshots taken by `page-shot` when no path was given |
+| `reports/` | the DONE report each finished agent leaves (`<id>.md`) — its appearing frees that order's slot |
 | `state.json` | which orders and files have been handled (watcher) |
 | `watcher.log` | what the watcher has done |
 | `terminal.log` | output of the agent windows the watcher opened |

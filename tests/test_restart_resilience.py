@@ -30,7 +30,7 @@ import watcher  # noqa: E402
 # tmp_env() stubs session_activity so no proof can touch the API by accident; the two
 # proofs ABOUT that reader call the real one through this reference.
 REAL_SESSION_ACTIVITY = watcher.session_activity
-REAL_TURN_IN_FLIGHT = watcher._turn_in_flight
+REAL_TURN_VERDICT = watcher._turn_verdict
 
 
 def tmp_env(tmp=None) -> str:
@@ -40,6 +40,7 @@ def tmp_env(tmp=None) -> str:
     watcher.LOG = os.path.join(d, "watcher.log")
     watcher.DOWNLOADS = os.path.join(d, "downloads")
     watcher.NEEDS_ORDER = os.path.join(d, "NEEDS-ORDER.md")
+    watcher.REPORTS = os.path.join(d, "reports")
     os.makedirs(watcher.INBOX, exist_ok=True)
     os.makedirs(watcher.DOWNLOADS, exist_ok=True)
     # a test must never open, or close, a real window on the user's desktop, and must
@@ -50,7 +51,7 @@ def tmp_env(tmp=None) -> str:
     watcher._close_window = lambda pid, script: None
     # the transcript probe: "nobody could say", which must always hold a slot.  A proof
     # that is about it overrides this.
-    watcher._turn_in_flight = lambda binp, sid: None
+    watcher._turn_verdict = lambda binp, sid: None
     return d
 
 
@@ -189,7 +190,7 @@ def test_a_dead_agent_frees_its_slot() -> str:
     assert [a["order"] for a in watcher.slot_agents(act, cfg(), probe=probe)] == ["WO-324"]
     assert sorted(probed) == ["WO-320", "WO-321", "WO-322", "WO-323"], probed
     # the pass decisions use it too, so the queue moves without anybody freeing a slot
-    watcher._turn_in_flight = lambda binp, sid: False
+    watcher._turn_verdict = lambda binp, sid: "idle"
     batch, held = watcher.dispatch_batch(cfg(), st, [order("WO-325")])
     assert [o["id"] for o in batch] == ["WO-325"] and held == [], (batch, held)
     return "four stale sessions with no turn running free their slots; the queue moves"
@@ -199,7 +200,7 @@ def test_a_silent_suite_keeps_its_slot_with_evidence() -> str:
     tmp_env()
     st = state(("WO-330", "ses_a", 2400), ("WO-331", "ses_b", 2400))
     watcher.session_activity = make_activity({"WO-330": 2400, "WO-331": 2400})
-    watcher._turn_in_flight = lambda binp, sid: True      # the tests are running
+    watcher._turn_verdict = lambda binp, sid: "working"   # the tests are running
     act = watcher.session_activity(cfg(), st)
     assert len(watcher.slot_agents(act, cfg(), probe=watcher.turn_probe(cfg()))) == 2
     batch, held = watcher.dispatch_batch(cfg(), st, [order("WO-332")])
@@ -231,7 +232,7 @@ def test_a_fresh_session_is_not_probed() -> str:
 
     def probe(a):
         called.append(a["order"])
-        return True
+        return "working"
 
     act = watcher.session_activity(cfg(), st)
     assert [a["order"] for a in watcher.slot_agents(act, cfg(), probe=probe)] == ["WO-340"]
@@ -256,7 +257,7 @@ def test_a_resume_that_did_not_take_frees_its_slot() -> str:
     st["resume"] = {"WO-360": {"count": 2, "at": time.time() - 1200},
                     "WO-361": {"count": 2, "at": time.time() - 1300}}
     watcher.session_activity = make_activity({"WO-360": 1200, "WO-361": 1300})
-    watcher._turn_in_flight = lambda binp, sid: False     # each resumed turn ended
+    watcher._turn_verdict = lambda binp, sid: "idle"      # each resumed turn ended
     act = watcher.session_activity(cfg(), st)
     assert watcher.slot_agents(act, cfg(), probe=watcher.turn_probe(cfg())) == []
     batch, held = watcher.dispatch_batch(cfg(), st, [order("WO-362")])
@@ -392,18 +393,29 @@ def test_the_probe_asks_once_and_only_for_the_tail() -> str:
 
     watcher._PROBE_MEMO.clear()
     watcher.oc_api = fake
-    assert REAL_TURN_IN_FLIGHT("bin", "ses_a") is False
-    assert REAL_TURN_IN_FLIGHT("bin", "ses_a") is False          # a second pass in one go
+    assert REAL_TURN_VERDICT("bin", "ses_a") == "idle"
+    assert REAL_TURN_VERDICT("bin", "ses_a") == "idle"          # a second pass in one go
     assert calls == ["/api/session/ses_a/message?limit=1"], calls
     # an idle marker means no turn; anything else is a turn
     watcher.oc_api = lambda *a, **k: {"data": [{"type": "assistant"}]}
     watcher._PROBE_MEMO.clear()
-    assert REAL_TURN_IN_FLIGHT("bin", "ses_b") is True
+    assert REAL_TURN_VERDICT("bin", "ses_b") == "working"
+    # ...unless it is parked on a human: alive, but nobody is working
+    watcher.oc_api = lambda *a, **k: {"data": [{"type": "assistant", "content": [
+        {"type": "text", "text": "Shall I use the staging key?"},
+        {"type": "tool", "name": "question", "state": {"status": "running"}}]}]}
+    watcher._PROBE_MEMO.clear()
+    assert REAL_TURN_VERDICT("bin", "ses_parked") == "waiting"
+    # a long shell is work, and it keeps its slot
+    watcher.oc_api = lambda *a, **k: {"data": [{"type": "assistant", "content": [
+        {"type": "tool", "name": "shell", "state": {"status": "running"}}]}]}
+    watcher._PROBE_MEMO.clear()
+    assert REAL_TURN_VERDICT("bin", "ses_shell") == "working"
     # and a truncated page (the CLI's habit on a big session) is unknown, never idle
     watcher._PROBE_MEMO.clear()
     watcher.oc_api = lambda *a, **k: {"raw": '{"data":[{"id":"msg_1","time":{"crea'}
-    assert REAL_TURN_IN_FLIGHT("bin", "ses_c") is None
-    return "one small request per session per few seconds, and a bad answer is 'unknown'"
+    assert REAL_TURN_VERDICT("bin", "ses_c") is None
+    return "one small request per session, and it tells work from a question"
 
 
 def test_an_unreadable_record_is_never_idle() -> str:
@@ -525,6 +537,125 @@ def test_reap_closes_quiet_windows_only() -> str:
     return "a quiet agent's window goes, a working one never does, a stranger's never does"
 
 
+# --- a turn parked on a person ---------------------------------------------------------
+
+def test_a_parked_turn_frees_its_slot() -> str:
+    """WO-113 in miniature: a question waiting on an answer must not hold the queue.
+
+    The turn is open, so the clock reads "working" - but nothing is computing, and the
+    queue stopped behind it for ten minutes while 3 GB of RAM sat spare.  A parked turn
+    is not work: it frees the slot, keeps its window, and says so in status.
+    """
+    tmp_env()
+    st = state(("WO-340", "ses_a", 2400), ("WO-341", "ses_b", 2400))
+    watcher.session_activity = make_activity({"WO-340": 2400, "WO-341": 2400})
+    watcher._turn_verdict = lambda binp, sid: "waiting" if sid == "ses_a" else "working"
+    act = watcher.session_activity(cfg(), st)
+    slots = [a["order"] for a in
+             watcher.slot_agents(act, cfg(), probe=watcher.turn_probe(cfg()))]
+    assert slots == ["WO-341"], slots              # the parked one holds no slot
+    batch, held = watcher.dispatch_batch(cfg(), st, [order("WO-342")])
+    assert [o["id"] for o in batch] == ["WO-342"] and held == [], (batch, held)
+    # and the pass records it as waiting for a person, not as work
+    assert watcher.note_waiting(st, {"WO-340": "waiting", "WO-341": "working"}) == ["WO-340"]
+    assert sorted(st["waiting"]) == ["WO-340"], st["waiting"]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        watcher.report_status(cfg(), st)
+    assert "WO-340  waiting for you" in buf.getvalue(), buf.getvalue()
+    assert "1 of 2 slots used" in buf.getvalue(), buf.getvalue()
+    # the mark clears the moment it has been answered
+    assert watcher.note_waiting(st, {"WO-340": "working", "WO-341": "working"}) == []
+    assert st["waiting"] == {}, st["waiting"]
+    return "a turn parked on a question frees its slot: the queue moves while a person thinks"
+
+
+def test_a_parked_window_is_neither_reaped_nor_resumed() -> str:
+    """That window is where the answer is typed, and a restart must not re-prompt it."""
+    d = tmp_env()
+    st = state(("WO-345", "ses_a", 9000))
+    st["waiting"] = {"WO-345": time.time()}
+    act = make_activity({"WO-345": 9000})(cfg(), st)
+    p = os.path.join(d, "ses_a.sh")
+    with open(p, "w") as fh:
+        fh.write("#!/bin/sh\n")
+    os.utime(p, (time.time() - 9000,) * 2)
+    killed: list[int] = []
+    watcher._close_window = lambda pid, script: killed.append(pid)
+    assert watcher.reap_windows(cfg(), st, act, windows=[{"pid": 111, "sid": "ses_a",
+                                                          "script": p}], force=True) == []
+    assert killed == [], "the window it asked its question in must stay"
+    watcher.oc_api, calls = stub_api({"ses_a": 9000})
+    assert watcher.resume_stalled(cfg(), st, act, {"from": 1, "to": 2}) == []
+    assert posts(calls) == [], calls
+    return "a parked agent keeps its window and is never resumed: the reply goes to it"
+
+
+# --- the report that frees its own slot -------------------------------------------------
+
+def test_a_report_file_finishes_the_order() -> str:
+    """The order asks the agent to leave its report; the file appearing is the signal.
+
+    Nothing in the loop can see the report land, so until now a finished order kept its
+    slot until a person noticed and ran ``watcher.sh done``.
+    """
+    tmp_env()
+    st = state(("WO-350", "ses_a", 600))
+    st["waiting"] = {"WO-350": time.time()}
+    act = make_activity({"WO-350": 600})(cfg(), st)
+    verdicts = {"WO-350": "idle"}
+    assert watcher.finish_reported_orders(cfg(), st, act, verdicts) == [], st["finished"]
+    os.makedirs(watcher.REPORTS, exist_ok=True)
+    with open(watcher.report_file("WO-350"), "w") as fh:
+        fh.write("DONE\n- project: wms shadow\n")
+    assert watcher.finish_reported_orders(cfg(), st, act, verdicts) == ["WO-350"]
+    assert sorted(st["finished"]) == ["WO-350"], st["finished"]
+    assert st["waiting"] == {}, "a finished order is not also waiting for a person"
+    # and nothing is finished while the turn is still running
+    st2 = state(("WO-353", "ses_c", 600))
+    with open(watcher.report_file("WO-353"), "w") as fh:
+        fh.write("DONE\n- project: x\n")
+    assert watcher.finish_reported_orders(cfg(), st2, make_activity({"WO-353": 600})(cfg(), st2),
+                                          {"WO-353": "working"}) == []
+    return "the report file finishes the order, so the slot frees with nobody watching"
+
+
+def test_a_report_in_the_transcript_finishes_the_order_too() -> str:
+    """A report sent the usual way counts as well, and a template read never does."""
+    tmp_env()
+    st = state(("WO-351", "ses_a", 600), ("WO-352", "ses_b", 600))
+    act = make_activity({"WO-351": 600, "WO-352": 600})(cfg(), st)
+    report = ("DONE\n- project: order platform server\n- branch: feat/wms-shadow\n"
+              "- commits: 2b9f688 (pushed)\n- tests: npm test 39 pass / 0 fail\n"
+              "- notes: nothing outstanding\n")
+
+    def fake(binp, method, path, payload=None, timeout=60):
+        if "limit=2" not in path:
+            raise AssertionError("the report scan asked for more than two: %s" % path)
+        if "ses_a" in path:                     # the report the agent typed
+            return {"data": [{"type": "idle"}, {"type": "assistant", "content": [
+                {"type": "tool", "name": "claude-bridge_ask_claude",
+                 "state": {"status": "completed", "input": {"message": report}}}]}]}
+        # a *read* of the AGENTS.md template: that text is a tool's output, not a report
+        return {"data": [{"type": "assistant", "content": [
+            {"type": "tool", "name": "read",
+             "state": {"status": "completed",
+                       "input": {"filePath": "/home/kilundi/.config/opencode/AGENTS.md"},
+                       "output": "When you finish, report: DONE\n  - project: <name>\n"
+                                 "  - branch: <branch>\n  - commits: <hashes>\n"}}]}]}
+
+    watcher.oc_api = fake
+    watcher._REPORT_SCAN.clear()
+    got = watcher.finish_reported_orders(
+        cfg(), st, act, {"WO-351": "idle", "WO-352": "idle"},
+        check=lambda oid, sid, moved: watcher.reported_done(cfg(), sid, moved))
+    assert got == ["WO-351"], got
+    assert sorted(st["finished"]) == ["WO-351"], st["finished"]
+    # the scan is a per-turn memo, not a per-pass one
+    assert watcher.reported_done(cfg(), "ses_b", 600) is False
+    return "a report sent with ask_claude finishes its order; reading the template does not"
+
+
 # --- watcher.sh status -----------------------------------------------------------------
 
 def test_a_stale_wait_is_not_reported_as_waiting() -> str:
@@ -532,11 +663,13 @@ def test_a_stale_wait_is_not_reported_as_waiting() -> str:
     tmp_env()
     st = state()
     st["held"] = {"WO-390": time.time(), "WO-391": time.time(), "WO-392": time.time()}
+    st["waiting"] = {"WO-393": time.time(), "WO-392": time.time()}
     st["finished"] = {"WO-392": time.time()}
     # this pass read WO-391 only: WO-390 has scrolled out, WO-392 is already finished
-    gone = watcher.prune_held(st, [order("WO-391")])
-    assert gone == ["WO-390", "WO-392"], gone
+    gone = watcher.prune_marks(st, [order("WO-391")])
+    assert sorted(gone) == ["WO-390", "WO-392", "WO-393"], gone
     assert sorted(st["held"]) == ["WO-391"], st["held"]
+    assert st["waiting"] == {}, st["waiting"]
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         watcher.report_status(cfg(), st)
@@ -575,7 +708,7 @@ def test_status_says_what_is_running() -> str:
     st["held"] = {"WO-382": time.time()}
     st["resume"] = {"WO-381": {"count": 3, "at": 1}}
     watcher.session_activity = make_activity({"WO-380": 60, "WO-381": 3000, "WO-383": 1200})
-    watcher._turn_in_flight = lambda binp, sid: sid == "ses_b"      # only WO-381 is running
+    watcher._turn_verdict = lambda binp, sid: "working" if sid == "ses_b" else "idle"
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         watcher.report_status(cfg(), st)
@@ -615,6 +748,10 @@ def main() -> int:
         ("resume takes the freshest first", test_resume_takes_the_freshest_first),
         ("a stale session is left alone", test_resume_too_old_is_left_alone),
         ("reaping closes quiet windows only", test_reap_closes_quiet_windows_only),
+        ("a parked turn frees its slot", test_a_parked_turn_frees_its_slot),
+        ("a parked window stays, no resume", test_a_parked_window_is_neither_reaped_nor_resumed),
+        ("a report file finishes the order", test_a_report_file_finishes_the_order),
+        ("a transcript report finishes too", test_a_report_in_the_transcript_finishes_the_order_too),
         ("status says what is running", test_status_says_what_is_running),
     ]
     failed = 0

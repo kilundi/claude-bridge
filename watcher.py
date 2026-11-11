@@ -43,6 +43,9 @@ LOG = os.path.join(HERE, "watcher.log")
 TERMINAL_LOG = os.path.join(HERE, "terminal.log")
 LOCK = os.path.join(HERE, "watcher.lock")
 DOWNLOADS = os.path.join(HERE, "downloads")
+# where an agent leaves its DONE report; the file appearing is what frees the order's
+# slot without anybody having to read the report first
+REPORTS = os.path.join(HERE, "reports")
 # written when a turn is stalled and Claude did not answer the one automatic ask
 NEEDS_ORDER = os.path.join(HERE, "NEEDS-ORDER.md")
 # where the opencode background server registers itself (pid, url, password)
@@ -408,17 +411,44 @@ def _moved_at(binp: str, sid: str) -> float | None:
 # A slot belongs to a running agent, and the only honest way to know is to look at the
 # session's transcript.  The answers are kept for a few seconds: one pass asks about the
 # same sessions more than once, and a hung API would charge its full timeout each time.
-_PROBE_MEMO: dict[str, tuple[float, bool | None]] = {}
+_PROBE_MEMO: dict[str, tuple[float, str | None]] = {}
+
+# The tools whose only job is to ask a person something.  A turn parked on one of these
+# is alive but nobody is working, which is the one case where a slot is held by
+# something that is not computing.
+PARKED_TOOLS = ("question", "permission")
 
 
-def _turn_in_flight(binp: str, sid: str, ttl: float = 15.0) -> bool | None:
-    """Whether a turn is running in this session *right now*.
+def _parked_on_a_human(message: dict) -> bool:
+    """Is this turn stopped, waiting for a person to answer?
+
+    The ``question`` tool (and a permission prompt) keeps its part ``running`` while it
+    waits, so the turn stays open and a timestamp cannot tell it from real work.  Only
+    the part says which it is - and only these two tools wait on a human by
+    construction: a long shell is work, and it must keep its slot.
+    """
+    for p in (message.get("content") or []):
+        if not isinstance(p, dict) or p.get("type") != "tool":
+            continue
+        name = str(p.get("name") or "").lower()
+        if not any(t in name for t in PARKED_TOOLS):
+            continue
+        if (p.get("state") or {}).get("status") in ("running", "pending"):
+            return True
+    return False
+
+
+def _turn_verdict(binp: str, sid: str, ttl: float = 15.0) -> str | None:
+    """What this session's turn is doing right now: ``working``, ``waiting``, ``idle``.
 
     A timestamp cannot answer it: a row of end-to-end tests is silent for 48 minutes
     and a turn killed with the background server is silent too, and the two want
-    opposite things.  The transcript itself can: its newest entry is an ``idle``
-    marker once a turn has ended, so a newest entry that is anything else means work
-    is in progress.
+    opposite things.  The transcript itself can: its newest entry is an ``idle`` marker
+    once a turn has ended, so a newest entry that is anything else means work is in
+    progress - and if that entry is parked on a human, the work is *not* happening.
+    Freeing that slot is the difference between a queue that keeps moving while a person
+    reads a question and one that stops behind it (WO-113 sat on a slot for ten minutes
+    waiting for an answer).
 
     ``limit=1`` keeps that answer to a few hundred bytes.  The whole page is ~400 KB
     and the CLI truncates it mid-JSON, which would read as "unknown" exactly when the
@@ -431,17 +461,80 @@ def _turn_in_flight(binp: str, sid: str, ttl: float = 15.0) -> bool | None:
     hit = _PROBE_MEMO.get(sid)
     if hit and time.time() - hit[0] < ttl:
         return hit[1]
-    answer: bool | None
+    answer: str | None
     try:
         page = oc_api(binp, "GET", "/api/session/%s/message?limit=1" % sid, timeout=20)
     except Exception:
         answer = None
     else:
         items = page.get("data") if isinstance(page, dict) else page
-        answer = None if not isinstance(items, list) or not items else \
-            (items[0] or {}).get("type") != "idle"
+        if not isinstance(items, list) or not items:
+            answer = None
+        elif (items[0] or {}).get("type") == "idle":
+            answer = "idle"
+        elif _parked_on_a_human(items[0] or {}):
+            answer = "waiting"
+        else:
+            answer = "working"
     _PROBE_MEMO[sid] = (time.time(), answer)
     return answer
+
+
+# A DONE report is the one thing an agent tells us that the loop cannot see: it is sent
+# to the planner, not to the watcher.  Recognising it is what lets a finished order free
+# its own slot, so the test is deliberately strict - a line that says DONE as a word,
+# plus at least two of the bullets the report format defines.
+REPORT_BULLETS = ("- project:", "- branch:", "- commits:", "- tests:", "- notes:")
+_DONE_WORD = re.compile(r"(^|[^A-Za-z])DONE([^A-Za-z]|$)")
+
+
+def looks_like_a_done_report(text: str) -> bool:
+    """Is this text a DONE report, or just something that mentions one?"""
+    text = text or ""
+    if not _DONE_WORD.search(text):
+        return False
+    return sum(1 for b in REPORT_BULLETS if b in text) >= 2
+
+
+def report_file(oid: str) -> str:
+    """Where an order's agent is asked to leave its report."""
+    return os.path.join(REPORTS, "%s.md" % oid)
+
+
+# a report is looked for once per turn, not once per pass: keyed by session and by when
+# that session last moved
+_REPORT_SCAN: dict[tuple[str, float], bool] = {}
+
+
+def reported_done(cfg: dict, sid: str, moved: float | None) -> bool:
+    """Is a DONE report in this session's own transcript?
+
+    Only the newest two entries are read and only the agent's own *input* counts: a
+    tool's output would match every time an agent read the AGENTS.md template, which is
+    not a report.  Anything unreadable answers ``False`` - the report file and
+    ``watcher.sh done`` still work, and a wrong "done" would be worse than a late one.
+    """
+    key = (sid, float(moved or 0))
+    if key in _REPORT_SCAN:
+        return _REPORT_SCAN[key]
+    found = False
+    try:
+        binp = os.path.expanduser((cfg.get("watch") or {}).get("opencode_bin")
+                                  or "~/.opencode/bin/opencode")
+        page = oc_api(binp, "GET", "/api/session/%s/message?limit=2" % sid, timeout=20)
+        items = page.get("data") if isinstance(page, dict) else page
+        for m in (items if isinstance(items, list) else []):
+            for p in ((m or {}).get("content") or []):
+                if isinstance(p, dict) and p.get("type") == "tool":
+                    state = p.get("state") or {}
+                    if looks_like_a_done_report(json.dumps(state.get("input") or "")):
+                        found = True
+    except Exception:
+        found = False
+    if len(_REPORT_SCAN) > 200:               # a long-lived watcher, a bounded memo
+        _REPORT_SCAN.clear()
+    _REPORT_SCAN[key] = found
+    return found
 
 
 def session_activity(cfg: dict, st: dict, now: float | None = None) -> list[dict]:
@@ -486,11 +579,13 @@ def slot_agents(activity: list[dict], cfg: dict, now: float | None = None,
     * quiet for less than ``slot_probe_seconds`` (2 min) - hold, no question asked.  That
       is the race guard: the window in which a prompt (a start, a resume, a new message
       from the user) has been accepted but its turn has not appeared yet.
-    * quiet for longer - ask ``probe`` whether a turn is running
-      (:func:`_turn_in_flight`).  Hold while one is, and free the slot the moment it has
-      ended, which is what an agent waiting for input deserves.  Note that a *resume is
-      not work*: it moved the clock, so the old rule held the slot for an hour even when
-      the resumed turn died in five seconds, and the queue stopped behind it.
+    * quiet for longer - ask ``probe`` what the turn is doing
+      (:func:`_turn_verdict`).  Hold while it is *working*; free the slot the moment it
+      has ended *or* parked itself on a human question - an agent waiting for input
+      deserves the first, and a queue must not stop behind the second.  Note that a
+      *resume is not work*: it moved the clock, so the old rule held the slot for an
+      hour even when the resumed turn died in five seconds, and the queue stopped
+      behind it.
     * past ``slot_seconds`` (an hour) - freed without asking.  The backstop for a probe
       that cannot answer, not the normal rule.
 
@@ -511,18 +606,19 @@ def slot_agents(activity: list[dict], cfg: dict, now: float | None = None,
         if age < grace:               # just moved, or just poked: never guess here
             out.append(a)
             continue
-        in_turn = probe(a) if probe else None
-        a["in_turn"] = in_turn
-        if in_turn is not False:      # running, or nobody could say: hold, never guess
-            out.append(a)
+        verdict = probe(a) if probe else None
+        a["turn"] = verdict
+        a["in_turn"] = None if verdict is None else (verdict == "working")
+        if verdict in (None, "working"):
+            out.append(a)             # working, or nobody could say: hold, never guess
     return out
 
 
 def turn_probe(cfg: dict):
-    """A ``probe`` for :func:`slot_agents`: is a turn running in this session?"""
+    """A ``probe`` for :func:`slot_agents`: what is this session's turn doing?"""
     binp = os.path.expanduser((cfg.get("watch") or {}).get("opencode_bin")
                               or "~/.opencode/bin/opencode")
-    return lambda a: _turn_in_flight(binp, a.get("session") or "")
+    return lambda a: _turn_verdict(binp, a.get("session") or "")
 
 
 def agent_busy(cfg: dict, st: dict, now: float | None = None) -> dict:
@@ -561,7 +657,8 @@ def resume_stalled(cfg: dict, st: dict, activity: list[dict], restarted: dict | 
     turns for nothing.  Bounded three ways - ``resume_max`` per order, one per
     ``resume_cooldown_seconds``, and ``resume_max_per_pass`` at a time, so a reboot
     cannot fire up every agent that ever ran - and it never touches an agent that is
-    working, or an order marked finished.
+    working, an order marked finished, or one whose agent is parked on a question
+    somebody still has to answer.
     """
     w = cfg.get("watch") or {}
     if dry_run or not w.get("resume_interrupted", True) or not restarted:
@@ -573,12 +670,13 @@ def resume_stalled(cfg: dict, st: dict, activity: list[dict], restarted: dict | 
     freshest = float(w.get("resume_max_age_seconds", 21600))
     res = st.setdefault("resume", {})
     done = st.get("finished") or {}
+    waiting = set(st.get("waiting") or {})
     cands: list[dict] = []
     for a in activity:
         oid = a["order"]
         rec = (st.get("starts") or {}).get(oid) or {}
         r = res.get(oid) or {}
-        if rec.get("status") != "started" or oid in done or a.get("live"):
+        if rec.get("status") != "started" or oid in done or oid in waiting or a.get("live"):
             continue
         if a.get("last") is None or now - a["last"] > freshest:
             continue                     # unreadable, or long past - leave it be
@@ -613,21 +711,26 @@ def resume_stalled(cfg: dict, st: dict, activity: list[dict], restarted: dict | 
     return out
 
 
-def prune_held(st: dict, orders: list[dict]) -> list[str]:
-    """Drop held markers that are no longer a real wait.
+def prune_marks(st: dict, orders: list[dict]) -> list[str]:
+    """Drop the held and waiting markers that are no longer a real wait.
 
-    Two kinds go: an order that is no longer in the chat's transcript (a held order is
-    deliberately left unmarked in ``orders`` so a later pass can still start it, but one
-    that has scrolled out will never be read again, and ``status`` showing it would be a
-    lie about the queue), and one that has since been marked finished.  Only markers for
-    orders read *this* pass and still open survive.
+    Both are recomputed every pass from the transcript, so only the markers for orders
+    read *this* pass and still open survive.  Two kinds go: an order that is no longer
+    in the chat's own transcript (a held order is deliberately left unmarked in
+    ``orders`` so a later pass can still start it, but one that has scrolled out will
+    never be read again, and ``status`` showing it would be a lie about the queue), and
+    one that has since been marked finished.
     """
-    holds = st.setdefault("held", {})
     here = {o["id"] for o in orders}
     done = set(st.get("finished") or {})
-    gone = [oid for oid in list(holds) if oid not in here or oid in done]
-    for oid in gone:
-        holds.pop(oid, None)
+    gone: list[str] = []
+    for key in ("held", "waiting"):
+        marks = st.setdefault(key, {})
+        for oid in list(marks):
+            if oid not in here or oid in done:
+                marks.pop(oid, None)
+                if oid not in gone:
+                    gone.append(oid)
     return gone
 
 
@@ -819,6 +922,13 @@ def order_to_inbox(order: dict, files: list[dict]) -> str:
         for p in order["missing_files"]:
             body.append("- %s" % p)
         body.append("")
+    body += ["## Reporting",
+             "Send your DONE report to the planner as usual, and save the same report to",
+             "  %s" % report_file(order["id"]),
+             "That file appearing is what marks this order finished and frees its slot, with",
+             "nobody having to notice the report first. Then stop - a continuation arrives as",
+             "a new work order, not in this session.",
+             ""]
     body += ["## Work order exactly as Claude wrote it", "```", order["raw"], "```", ""]
     path = os.path.join(INBOX, "%s.md" % order["id"])
     with open(path, "w") as fh:
@@ -858,7 +968,7 @@ def build_prompt(order: dict, files: list[dict], inbox_path: str) -> str:
         "The full order, exactly as Claude wrote it, is saved at %s." % inbox_path,
         "",
         "Do the work: make the change, run the checks, and commit and push to the branch above.",
-        "When you are finished, report back to Claude with the ask_claude tool:",
+        "When you are finished, send your DONE report to the planner with the ask_claude tool:",
         "  DONE",
         "  - project: <name>",
         "  - branch: <branch>",
@@ -866,7 +976,14 @@ def build_prompt(order: dict, files: list[dict], inbox_path: str) -> str:
         "  - tests: <what you ran and the result>",
         "  - notes: <anything odd, or a question>",
         "  NEXT: what should I take on?",
-        "Then wait for Claude's next work order.",
+        "",
+        "Save that same report to %s as well - that file appearing is what marks this order"
+        % report_file(order["id"]),
+        "finished and frees its slot for the next one, with nobody having to notice the report",
+        "first. Then stop: a continuation arrives as a new work order, not in this session.",
+        "If you are blocked on something only the person can decide, say so plainly in the",
+        "report - your slot is freed while you wait, and your window is kept open for the",
+        "answer.",
     ]
     return "\n".join(lines)
 
@@ -1036,7 +1153,8 @@ def reap_windows(cfg: dict, st: dict, activity: list[dict] | None = None,
     ``force`` (what ``watcher.sh reap`` asks for) closes every agent window that is not
     working right now.  Otherwise a window goes only once its agent has been quiet for
     ``reap_idle_seconds`` and the window itself is at least that old - closing eagerly
-    would close the very window a 48 minute test run is sitting in.
+    would close the very window a 48 minute test run is sitting in.  An agent parked on
+    a question is never closed either: that window is where the answer is typed.
     """
     w = cfg.get("watch") or {}
     if dry_run or not w.get("launch_terminal", True):
@@ -1047,11 +1165,14 @@ def reap_windows(cfg: dict, st: dict, activity: list[dict] | None = None,
            (activity if activity is not None else session_activity(cfg, st))}
     by_sid = {sid: oid for oid, sid in (st.get("sessions") or {}).items()}
     done = set(st.get("finished") or {})
+    waiting = set(st.get("waiting") or {})
     closed: list[str] = []
     for win in agent_windows(windows):
         oid = by_sid.get(win["sid"])
         if oid is None or oid in closed:
             continue                        # not one of ours - leave it alone
+        if oid in waiting:
+            continue                        # it asked a question: that is where it is answered
         a = act.get(oid) or {}
         if a.get("live") and oid not in done:
             continue                        # it is working: never close its window
@@ -1078,14 +1199,68 @@ def reap_windows(cfg: dict, st: dict, activity: list[dict] | None = None,
 def finish_order(st: dict, oid: str) -> None:
     """Mark an order finished: frees its agent slot and stops any resume.
 
-    Nothing in the loop can tell "the agent has reported DONE" from "the agent is
-    thinking", so a human says so (``watcher.sh done WO-111``).  Memory-wise that is
-    the difference between a slot freed now and one freed two hours from now.
+    Nothing in the loop can *see* the agent report DONE - it goes to the planner - so
+    :func:`finish_reported_orders` reads the two signals that say it anyway (the report
+    file, or the report in the agent's own transcript), and a human says so for the
+    rest (``watcher.sh done WO-111``).  Memory-wise that is the difference between a
+    slot freed now and one freed two hours from now.
     """
     st.setdefault("finished", {})[oid] = time.time()
     (st.get("resume") or {}).pop(oid, None)
     (st.get("held") or {}).pop(oid, None)
+    (st.get("waiting") or {}).pop(oid, None)
     save_state(st)
+
+
+def note_waiting(st: dict, verdicts: dict) -> list[str]:
+    """Record the agents whose turn is parked on a person, for status and reap.
+
+    ``verdicts`` is this pass's ``order -> _turn_verdict`` map, so the slot count, the
+    status rows and this mark are all the same reading of the same turn.  An order that
+    was parked and is not any more drops the mark: it has been answered, and it is
+    working again.  Returns the orders that have just parked, for the log.
+    """
+    wait = st.setdefault("waiting", {})
+    was = set(wait)
+    for oid, v in verdicts.items():
+        if v == "waiting":
+            wait.setdefault(oid, time.time())    # keep the moment it asked
+        else:
+            wait.pop(oid, None)
+    return sorted(set(wait) - was)
+
+
+def finish_reported_orders(cfg: dict, st: dict, activity: list[dict], verdicts: dict,
+                           check=None) -> list[str]:
+    """Finish the orders whose agent has reported DONE, and return them.
+
+    Only ever for an order that is started, not finished, and whose *turn is over*: a
+    report arrives at the end of one.  Two signals say it, either is enough:
+
+    * the report file the order asks the agent to leave (:func:`report_file`), which is
+      the reliable one and stays on disk for the person to read;
+    * the report in the agent's own transcript (:func:`reported_done`), which catches a
+      report sent the usual way without an agent having to do anything new - checked
+      once per turn, and it costs one small read per candidate.
+    """
+    done = st.get("finished") or {}
+    out: list[str] = []
+    for a in activity:
+        oid = a["order"]
+        if oid in done or verdicts.get(oid) != "idle":
+            continue                        # finished already, or still in a turn
+        if (st.get("starts") or {}).get(oid, {}).get("status") != "started":
+            continue
+        if os.path.exists(report_file(oid)):
+            why = "left %s" % os.path.basename(report_file(oid))
+        elif check and check(oid, a.get("session") or "", a.get("last")):
+            why = "reported DONE in its transcript"
+        else:
+            continue
+        finish_order(st, oid)
+        log("%s is finished - its agent %s, so its slot is free" % (oid, why))
+        out.append(oid)
+    return out
 
 
 def download_new_files(b: Bridge, st: dict) -> list[dict]:
@@ -1252,7 +1427,23 @@ def pass_once(cfg: dict, st: dict, dry_run: bool = False) -> dict:
             "any running order lost its turn with it"
             % (restarted.get("from"), restarted.get("to")))
     activity = [] if dry_run else session_activity(cfg, st)
+    verdicts: dict[str, str] = {}
     if activity:
+        # One probe per session for the whole pass: the same reading decides the slot
+        # count, the "waiting for you" rows, and whether an agent has reported DONE.
+        # (The probe memo makes the later calls free.)
+        probe = turn_probe(cfg)
+        for a in activity:
+            v = probe(a)
+            if v is not None:
+                verdicts[a["order"]] = v
+        for oid in note_waiting(st, verdicts):
+            log("%s is waiting for an answer - its slot is free while it waits, and its "
+                "window stays open for the reply" % oid)
+        # before the resume and the reap: a reported order is finished, so neither
+        # should touch it
+        finish_reported_orders(cfg, st, activity, verdicts,
+                               check=lambda oid, sid, moved: reported_done(cfg, sid, moved))
         resume_stalled(cfg, st, activity, restarted, dry_run=dry_run)
         reap_windows(cfg, st, activity, dry_run=dry_run)
     if not cdp_alive():
@@ -1320,8 +1511,8 @@ def pass_once(cfg: dict, st: dict, dry_run: bool = False) -> dict:
         orders.extend(extract_work_orders(m))
     routed = route_orders(st, orders)
     new = routed["dispatch"]
-    for gone in prune_held(st, orders):
-        log("%s is no longer in the chat - it is not waiting for a slot any more" % gone)
+    for gone in prune_marks(st, orders):
+        log("%s is no longer in the chat - it is not waiting for anything any more" % gone)
 
     # Only the orders that fit under max_agents have their files pulled down now; a
     # held one is fetched when it starts, so a loaded machine does not do that work
@@ -1386,6 +1577,7 @@ def report_status(cfg: dict, st: dict) -> int:
     # printed here is what will happen, not a guess beside it
     slots = {a["order"] for a in slot_agents(act, cfg, probe=turn_probe(cfg))}
     done = set(st.get("finished") or {})
+    waiting = set(st.get("waiting") or {})
     now = time.time()
     print("agents: %d of %s slots used (max_agents=%s)"
           % (len(slots), cap or "unlimited", cap or "none"))
@@ -1394,6 +1586,8 @@ def report_status(cfg: dict, st: dict) -> int:
         age = (now - a["last"]) if a.get("last") else None
         if oid in done:
             state = "finished"
+        elif oid in waiting:
+            state = "waiting for you"     # parked on a question: no slot, window kept
         elif age is None:
             state = "unreadable"
         elif age < grace:

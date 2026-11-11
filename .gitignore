@@ -2,7 +2,7 @@
 #
 # config.json      your chat_url, default_dir and model choice
 # state.json       which orders/files this machine has already handled
-# inbox/ downloads/ outbox/ drafts/ shots/ terminals/   real work orders and files from the chat
+# inbox/ downloads/ outbox/ drafts/ shots/ reports/ terminals/   real work orders, files and reports from the chat
 # PLAN-continuation-and-accounts.md      the local plan - it names real accounts and a real project
 # NEEDS-ORDER.md                         written when a turn stalled - names the real chat
 # *.log *.out *.pid *.lock               runtime noise
@@ -23,6 +23,7 @@ downloads/
 outbox/
 drafts/
 shots/
+reports/
 terminals/
 
 __pycache__/
