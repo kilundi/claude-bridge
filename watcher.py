@@ -505,13 +505,20 @@ def report_file(oid: str) -> str:
 # that session last moved
 _REPORT_SCAN: dict[tuple[str, float], bool] = {}
 
+# How far back a report is looked for.  One turn can leave several messages *after* the
+# report itself - WO-120 reported DONE at 15:51:37 and then talked about the next order for
+# two more messages before its turn ended, which a two-entry scan missed entirely.  Six
+# entries stay small enough to survive the CLI's truncation in normal use; the report file
+# is the reliable path for everything else.
+REPORT_SCAN_MESSAGES = 6
+
 
 def reported_done(cfg: dict, sid: str, moved: float | None) -> bool:
     """Is a DONE report in this session's own transcript?
 
-    Only the newest two entries are read and only the agent's own *input* counts: a
-    tool's output would match every time an agent read the AGENTS.md template, which is
-    not a report.  Anything unreadable answers ``False`` - the report file and
+    The newest ``REPORT_SCAN_MESSAGES`` entries are read, and only the agent's own *input*
+    counts: a tool's *output* would match every time an agent read the AGENTS.md template,
+    which is not a report.  Anything unreadable answers ``False`` - the report file and
     ``watcher.sh done`` still work, and a wrong "done" would be worse than a late one.
     """
     key = (sid, float(moved or 0))
@@ -521,7 +528,8 @@ def reported_done(cfg: dict, sid: str, moved: float | None) -> bool:
     try:
         binp = os.path.expanduser((cfg.get("watch") or {}).get("opencode_bin")
                                   or "~/.opencode/bin/opencode")
-        page = oc_api(binp, "GET", "/api/session/%s/message?limit=2" % sid, timeout=20)
+        page = oc_api(binp, "GET", "/api/session/%s/message?limit=%d"
+                      % (sid, REPORT_SCAN_MESSAGES), timeout=20)
         items = page.get("data") if isinstance(page, dict) else page
         for m in (items if isinstance(items, list) else []):
             for p in ((m or {}).get("content") or []):
@@ -538,17 +546,22 @@ def reported_done(cfg: dict, sid: str, moved: float | None) -> bool:
 
 
 def session_activity(cfg: dict, st: dict, now: float | None = None) -> list[dict]:
-    """When each agent last moved: [{"order","session","last","live"}].
+    """When each agent last moved: [{"order","session","last","live","finished"}].
 
-    ``outcome`` is not a liveness signal - a busy agent reads as "interrupted" - so
-    the session's own timestamps are what we count.  ``last`` is None when it cannot
-    be read: unknown, and never treated as idle.  Oldest start first.
+    ``outcome`` is not a liveness signal: a busy agent reads as "interrupted", and so
+    does one a *person* stopped (WO-122, 2026-11-11 15:55) - the two are identical, so a
+    resume stays tied to the service restart it can actually prove.  The session's own
+    timestamps are what we count.  ``last`` is None when it cannot be read: unknown, and
+    never treated as idle.  ``finished`` is carried along so the slot count can leave
+    those orders out: a person poking a finished session must not hold a worker slot.
+    Oldest start first.
     """
     now = now or time.time()
     w = cfg.get("watch") or {}
     binp = os.path.expanduser(w.get("opencode_bin") or "~/.opencode/bin/opencode")
     window = float(w.get("agent_active_seconds", 1800))
     starts = st.get("starts") or {}
+    done = st.get("finished") or {}
     out: list[dict] = []
     for oid, sid in (st.get("sessions") or {}).items():
         last: float | None = None
@@ -556,7 +569,7 @@ def session_activity(cfg: dict, st: dict, now: float | None = None) -> list[dict
             last = _moved_at(binp, sid)
         except Exception as e:
             log("  could not read %s's session record: %s" % (oid, e))
-        out.append({"order": oid, "session": sid, "last": last,
+        out.append({"order": oid, "session": sid, "last": last, "finished": oid in done,
                     "live": bool(last and now - last < window)})
     out.sort(key=lambda a: (starts.get(a["order"]) or {}).get("updated") or 0)
     return out
@@ -589,6 +602,8 @@ def slot_agents(activity: list[dict], cfg: dict, now: float | None = None,
     * past ``slot_seconds`` (an hour) - freed without asking.  The backstop for a probe
       that cannot answer, not the normal rule.
 
+    An order marked finished holds no slot whatever its session is doing: the person may
+    still be typing in that window, and that is not a worker.
     ``watcher.sh done <id>`` frees a slot at once, which is what a DONE report means.
     """
     now = now or time.time()
@@ -597,6 +612,8 @@ def slot_agents(activity: list[dict], cfg: dict, now: float | None = None,
     grace = float(w.get("slot_probe_seconds", 120))
     out: list[dict] = []
     for a in activity:
+        if a.get("finished"):
+            continue
         last = a.get("last")
         if last is None:              # unreadable: never counted, as it never was
             continue

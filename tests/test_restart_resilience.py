@@ -84,11 +84,13 @@ def make_activity(ages: dict):
     """A session_activity() replacement: {oid: seconds since its transcript moved}."""
     def f(cfg_, st_, now=None):
         now = now or time.time()
+        done = st_.get("finished") or {}
         out = []
         for oid, sid in (st_.get("sessions") or {}).items():
             age = ages.get(oid)
             last = None if age is None else now - age
             out.append({"order": oid, "session": sid, "last": last,
+                        "finished": oid in done,
                         "live": bool(last and age < 1800)})
         out.sort(key=lambda a: (st_.get("starts", {}).get(a["order"]) or {}).get("updated") or 0)
         return out
@@ -591,6 +593,30 @@ def test_a_parked_window_is_neither_reaped_nor_resumed() -> str:
     return "a parked agent keeps its window and is never resumed: the reply goes to it"
 
 
+# --- a finished order is not a worker --------------------------------------------------
+
+def test_a_finished_order_holds_no_slot() -> str:
+    """Once the work is done it is not a worker, however much its window is being poked.
+
+    WO-122's window was still in use after ``watcher.sh done`` marked it finished, and
+    its session counted against the cap that way - status read "3 of 2 slots used".
+    """
+    tmp_env()
+    st = state(("WO-370", "ses_a", 30))          # just moved: the race guard would hold it
+    st["finished"] = {"WO-370": time.time()}
+    watcher.session_activity = make_activity({"WO-370": 30})
+    act = watcher.session_activity(cfg(), st)
+    assert act[0]["finished"] is True, act
+    assert watcher.slot_agents(act, cfg(), probe=lambda a: "working") == []
+    batch, held = watcher.dispatch_batch(cfg(), st, [order("WO-371")])
+    assert [o["id"] for o in batch] == ["WO-371"] and held == [], (batch, held)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        watcher.report_status(cfg(), st)
+    assert "0 of 2 slots used" in buf.getvalue(), buf.getvalue()
+    return "a finished order's session is not a worker, even when its window is being poked"
+
+
 # --- the report that frees its own slot -------------------------------------------------
 
 def test_a_report_file_finishes_the_order() -> str:
@@ -630,19 +656,28 @@ def test_a_report_in_the_transcript_finishes_the_order_too() -> str:
               "- notes: nothing outstanding\n")
 
     def fake(binp, method, path, payload=None, timeout=60):
-        if "limit=2" not in path:
-            raise AssertionError("the report scan asked for more than two: %s" % path)
+        if "limit=6" not in path:
+            raise AssertionError("the report scan asked for the wrong depth: %s" % path)
+        # an agent that talks after it reports: the report sits three entries back, which
+        # is exactly what WO-120 did (DONE at 15:51:37, two more messages, then idle)
+        chat = [{"type": "idle"},
+                {"type": "assistant", "content": [{"type": "text", "text": "and next?"}]},
+                {"type": "assistant", "content": [{"type": "text", "text": "reading"}]}]
         if "ses_a" in path:                     # the report the agent typed
-            return {"data": [{"type": "idle"}, {"type": "assistant", "content": [
-                {"type": "tool", "name": "claude-bridge_ask_claude",
-                 "state": {"status": "completed", "input": {"message": report}}}]}]}
-        # a *read* of the AGENTS.md template: that text is a tool's output, not a report
-        return {"data": [{"type": "assistant", "content": [
-            {"type": "tool", "name": "read",
-             "state": {"status": "completed",
-                       "input": {"filePath": "/home/kilundi/.config/opencode/AGENTS.md"},
-                       "output": "When you finish, report: DONE\n  - project: <name>\n"
-                                 "  - branch: <branch>\n  - commits: <hashes>\n"}}]}]}
+            chat.append({"type": "assistant", "content": [
+                {"type": "tool", "name": "execute", "state": {
+                    "status": "completed", "input": {"code": "const msg = `%s`" % report}}}]})
+            chat += [{"type": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                     {"type": "assistant", "content": [{"type": "text", "text": "ok"}]}]
+        else:
+            # a *read* of the AGENTS.md template: that text is a tool's output, not a report
+            chat.append({"type": "assistant", "content": [
+                {"type": "tool", "name": "read",
+                 "state": {"status": "completed",
+                           "input": {"filePath": "/home/kilundi/.config/opencode/AGENTS.md"},
+                           "output": "When you finish, report: DONE\n  - project: <name>\n"
+                                     "  - branch: <branch>\n  - commits: <hashes>\n"}}]})
+        return {"data": chat}
 
     watcher.oc_api = fake
     watcher._REPORT_SCAN.clear()
@@ -653,7 +688,7 @@ def test_a_report_in_the_transcript_finishes_the_order_too() -> str:
     assert sorted(st["finished"]) == ["WO-351"], st["finished"]
     # the scan is a per-turn memo, not a per-pass one
     assert watcher.reported_done(cfg(), "ses_b", 600) is False
-    return "a report sent with ask_claude finishes its order; reading the template does not"
+    return "a report three entries back finishes its order; reading the template does not"
 
 
 # --- watcher.sh status -----------------------------------------------------------------
@@ -749,6 +784,7 @@ def main() -> int:
         ("a stale session is left alone", test_resume_too_old_is_left_alone),
         ("reaping closes quiet windows only", test_reap_closes_quiet_windows_only),
         ("a parked turn frees its slot", test_a_parked_turn_frees_its_slot),
+        ("a finished order holds no slot", test_a_finished_order_holds_no_slot),
         ("a parked window stays, no resume", test_a_parked_window_is_neither_reaped_nor_resumed),
         ("a report file finishes the order", test_a_report_file_finishes_the_order),
         ("a transcript report finishes too", test_a_report_in_the_transcript_finishes_the_order_too),

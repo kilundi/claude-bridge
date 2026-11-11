@@ -226,9 +226,9 @@ Two signals settle it without asking anybody:
 * **the report file.** Every new order asks its agent to save the same report to
   `~/claude-bridge/reports/<ORDER-ID>.md`; the file stays there, so the reports are also a
   readable record of what each order did.
-* **the report itself**, found in the agent's own transcript — the newest two entries, and
-  only what the agent *typed*: a tool's *output* would match every time an agent read this
-  AGENTS.md template, and that is not a report.
+* **the report itself**, found in the agent's own transcript — the newest few entries (six),
+  and only what the agent *typed*: a tool's *output* would match every time an agent read
+  this AGENTS.md template, and that is not a report.
 
 Either one marks the order finished: its slot is free at once, it is never resumed, and
 `watcher.sh status` shows it as finished.

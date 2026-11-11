@@ -71,8 +71,13 @@ if fd is None:
 else:
     st = watcher.load_state()
     watcher.handle_orders(cfg, st, [order], files=[])
-    time.sleep(1.0)        # hold the lock long enough for the other to fail
     print("lock", flush=True)
+    # Hold the lock until the *test* says so, however slow the machine is.  A fixed
+    # sleep raced the clock: on a loaded box the second process started after the
+    # holder had already let go, and both honestly reported "lock".
+    deadline = time.time() + 30
+    while not os.path.exists(os.environ["CB_RELEASE"]) and time.time() < deadline:
+        time.sleep(0.02)
 '''
 
 
@@ -108,12 +113,13 @@ def test_simultaneous_start() -> str:
         fh.write(WORKER)
     starts = os.path.join(d, "starts.log")
     go = os.path.join(d, "go")
+    release = os.path.join(d, "release")
 
     env = dict(os.environ)
     env.update({
         "CB_DIR": ROOT, "CB_STATE": watcher.STATE, "CB_INBOX": watcher.INBOX,
         "CB_LOG": watcher.LOG, "CB_LOCK": watcher.LOCK, "CB_STARTS": starts,
-        "CB_ORDER": json.dumps(ORDER), "CB_GO": go,
+        "CB_ORDER": json.dumps(ORDER), "CB_GO": go, "CB_RELEASE": release,
     })
     env.pop("WATCHER_LOCK_FD", None)
 
@@ -124,11 +130,24 @@ def test_simultaneous_start() -> str:
     ]
     time.sleep(0.6)              # both are lined up on the go file
     open(go, "w").close()        # release them at the same instant
+    # Read each verdict *while the holder still holds the lock*, then let it go: what
+    # matters is what the second process saw at the instant it asked.  (A worker's
+    # stdout carries its log lines too, so read on until the verdict itself.)
     outs = []
     for p in procs:
-        out, err = p.communicate(timeout=60)
-        lines = (out or "").strip().splitlines()
-        outs.append(lines[-1] if lines else "rc=%s %s" % (p.returncode, (err or "").strip()[:200]))
+        verdict = ""
+        while True:
+            line = (p.stdout.readline() or "").strip()
+            if not line:
+                verdict = "rc=%s %s" % (p.returncode, (p.stderr.read() or "").strip()[:200])
+                break
+            if line in ("lock", "nolock"):
+                verdict = line
+                break
+        outs.append(verdict)
+    open(release, "w").close()
+    for p in procs:
+        p.communicate(timeout=60)
 
     holders = outs.count("lock")
     losers = outs.count("nolock")
