@@ -1353,24 +1353,30 @@ def report_status(cfg: dict, st: dict) -> int:
     """Print what the loop is doing with agents right now (``watcher.sh status``)."""
     w = cfg.get("watch") or {}
     cap = int(w.get("max_agents") or 0)
+    grace = float(w.get("slot_probe_seconds", 120))
     act = session_activity(cfg, st)
+    # this is the same decision the next pass will make, probe and all, so what is
+    # printed here is what will happen, not a guess beside it
     slots = {a["order"] for a in slot_agents(act, cfg, probe=turn_probe(cfg))}
-    live = live_agents(act)
-    quiet_held = slots - {a["order"] for a in live}
     done = set(st.get("finished") or {})
-    print("agents: %d working, %d quiet but holding a slot (max_agents=%s)"
-          % (len(live), len(quiet_held), cap or "none"))
+    now = time.time()
+    print("agents: %d of %s slots used (max_agents=%s)"
+          % (len(slots), cap or "unlimited", cap or "none"))
     for a in act:
-        if a["order"] in done:
+        oid = a["order"]
+        age = (now - a["last"]) if a.get("last") else None
+        if oid in done:
             state = "finished"
-        elif a.get("live"):
-            state = "working"
-        elif a["order"] in slots:
-            state = "slot"
+        elif age is None:
+            state = "unreadable"
+        elif age < grace:
+            state = "just moved"          # held without asking: the race guard
+        elif oid in slots:
+            state = "working" if a.get("in_turn") else "quiet, slot held"
         else:
             state = "idle"
-        ago = ("%.0f min ago" % ((time.time() - a["last"]) / 60)) if a.get("last") else "unknown"
-        print("  %-7s %-8s last moved %s" % (a["order"], state, ago))
+        ago = ("%.0f min ago" % (age / 60)) if age is not None else "unknown"
+        print("  %-7s %-16s last moved %s" % (oid, state, ago))
     for oid, r in sorted((st.get("resume") or {}).items()):
         n = int(r.get("count") or 0)
         print("  %-7s resumed %d time(s)%s"

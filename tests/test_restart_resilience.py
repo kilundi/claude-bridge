@@ -526,19 +526,22 @@ def test_reap_closes_quiet_windows_only() -> str:
 
 def test_status_says_what_is_running() -> str:
     tmp_env()
-    st = state(("WO-380", "ses_a", 60), ("WO-381", "ses_b", 3000))
+    st = state(("WO-380", "ses_a", 60), ("WO-381", "ses_b", 3000), ("WO-383", "ses_c", 1200))
     st["held"] = {"WO-382": time.time()}
     st["resume"] = {"WO-381": {"count": 3, "at": 1}}
-    watcher.session_activity = make_activity({"WO-380": 60, "WO-381": 3000})
+    watcher.session_activity = make_activity({"WO-380": 60, "WO-381": 3000, "WO-383": 1200})
+    watcher._turn_in_flight = lambda binp, sid: sid == "ses_b"      # only WO-381 is running
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         watcher.report_status(cfg(), st)
     out = buf.getvalue()
-    assert "1 working, 1 quiet but holding a slot (max_agents=2)" in out, out
-    assert "WO-380  working" in out and "WO-381  slot" in out, out
+    assert "2 of 2 slots used (max_agents=2)" in out, out
+    assert "WO-380  just moved" in out, out
+    assert "WO-381  working" in out, out
+    assert "WO-383  idle" in out, out            # its turn ended: it holds no slot
     assert "WO-382  waiting for a free agent slot" in out, out
     assert "WO-381  resumed 3 time(s) - have a look at it" in out, out
-    return "watcher.sh status shows working / slot / waiting / resumed at a glance"
+    return "watcher.sh status shows the slots used, who is working, who is idle, who waits"
 
 
 def main() -> int:
