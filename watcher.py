@@ -1056,6 +1056,87 @@ TERMINALS = (
 )
 TERMINALS_DIR = os.path.join(HERE, "terminals")
 
+# --- one window per repository -----------------------------------------------------------
+# A window per work order fills the desktop with near-identical windows as soon as several
+# orders run in one repo: five orders in `~/projects` were five qterminal windows, all
+# titled "... - projects".  So a repository gets ONE window, and each order becomes a tab in
+# it.  The tabs cannot come from the terminal emulator - qterminal 2.4.0 has no flag for
+# opening a tab in an existing window and no D-Bus service to ask - so the repository's tabs
+# live in a tmux session, and the window is opened only when the repository has none.
+# `tabs: false` in config.json gives back one window per order.
+
+
+def tmux_binary() -> str | None:
+    return shutil.which("tmux")
+
+
+def tmux_session_name(directory: str) -> str:
+    """A stable, tmux-safe session name for a directory: cb-<repo>-<hash>.
+
+    The directory is normalised first, so `/a/b` and `/a/b/` are the same repository - and
+    therefore the same window.
+    """
+    directory = directory.rstrip("/") or "/"
+    base = re.sub(r"[^A-Za-z0-9_-]+", "-", os.path.basename(directory) or "root")
+    base = base.strip("-")[:24] or "root"
+    return "cb-%s-%s" % (base, hashlib.sha1(directory.encode("utf-8")).hexdigest()[:8])
+
+
+def window_name(oid: str) -> str:
+    """A tab name tmux can still read as a target: no `:`, no `.`."""
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", oid).strip("-") or "order"
+
+
+def tmux(*args: str, timeout: float = 10) -> tuple[int, str]:
+    """Run tmux and never raise: (returncode, output).  Best effort, like the window."""
+    exe = tmux_binary()
+    if not exe:
+        return 1, "tmux is not installed"
+    try:
+        p = subprocess.run([exe, *args], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=timeout)
+    except Exception as e:  # no server, no permission, ...
+        return 1, str(e)
+    return p.returncode, p.stdout.decode("utf-8", "replace")
+
+
+def tmux_sessions() -> list[str]:
+    """The tmux sessions this watcher made - ours by name, so nothing else is touched."""
+    rc, out = tmux("list-sessions", "-F", "#{session_name}")
+    if rc != 0:
+        return []
+    return [s for s in out.split() if s.startswith("cb-")]
+
+
+def tmux_tabs(slug: str) -> list[str]:
+    """The tabs (tmux windows) of one repository's session, in tab order."""
+    rc, out = tmux("list-windows", "-t", slug, "-F", "#{window_name}")
+    if rc != 0:
+        return []
+    return out.split()
+
+
+def close_tab(target: str) -> bool:
+    """Close one tab, and the repository's window with the last tab of it.
+
+    Killing the tmux window kills the agent's TUI with it - that is the memory being freed.
+    The terminal window exits by itself when the session it is attached to ends.
+    """
+    slug = target.split(":", 1)[0]
+    rc, out = tmux("kill-window", "-t", target)
+    if rc != 0:
+        log("  could not close the tab %s: %s" % (target, out.strip()))
+        return False
+    if not tmux_tabs(slug):
+        tmux("kill-session", "-t", slug)
+    return True
+
+
+def script_path(sid: str) -> str:
+    """The launcher script of an order's view: the tab script when tabs are in use."""
+    tab = os.path.join(TERMINALS_DIR, "tab-%s.sh" % sid)
+    return tab if os.path.exists(tab) else os.path.join(TERMINALS_DIR, "%s.sh" % sid)
+
 
 def write_terminal_script(oid: str, sid: str, directory: str, title: str, opencode_bin: str) -> str:
     """Write the tiny script the window runs.
@@ -1080,11 +1161,50 @@ def write_terminal_script(oid: str, sid: str, directory: str, title: str, openco
     return path
 
 
-def open_agent_terminal(cfg: dict, oid: str, sid: str, directory: str) -> bool:
-    """Open a terminal window attached to the agent's session. Best effort only.
+def write_tab_script(oid: str, sid: str, directory: str, title: str, slug: str) -> str:
+    """Write the per-repository window script: the session, this order as its first tab.
 
-    The agent is already running on the server by this point, so a failure here costs
-    nothing but the window - it is logged, and the order still succeeds.
+    One script does both jobs, because a window is only ever opened when the repository has
+    none: `has-session` decides between attaching to the tabs that are already there and
+    creating the session with this order as its first tab.  A session whose window was
+    closed by hand is re-attached the same way, with all of its tabs intact.
+
+    The status line is the only hint a person gets about how to move between tabs, so it
+    says so; `mouse on` lets them click a tab instead of learning the key.
+    """
+    os.makedirs(TERMINALS_DIR, exist_ok=True)
+    path = os.path.join(TERMINALS_DIR, "tab-%s.sh" % sid)
+    ts = shlex.quote(tmux_binary() or "tmux")
+    s = shlex.quote(slug)
+    first = shlex.quote("bash " + os.path.join(TERMINALS_DIR, "%s.sh" % sid))
+    body = (
+        "#!/usr/bin/env bash\n"
+        "# opened by watcher.py for %s - one window per repository, one tab per work order\n"
+        "cd %s || exit 1\n"
+        "printf '\\033]2;%%s\\007' %s\n"
+        "if %s has-session -t %s 2>/dev/null; then\n"
+        "  exec %s attach -t %s\n"
+        "fi\n"
+        "%s new-session -d -s %s -n %s %s\n"
+        "%s set-option -t %s mouse on\n"
+        "%s set-option -t %s status-left '[Ctrl-b n/p] '\n"
+        "exec %s attach -t %s\n"
+        % (oid, shlex.quote(directory), shlex.quote(title),
+           ts, s, ts, s,
+           ts, s, shlex.quote(window_name(oid)), first,
+           ts, s, ts, s, ts, s)
+    )
+    with open(path, "w") as fh:
+        fh.write(body)
+    os.chmod(path, 0o755)
+    return path
+
+
+def open_agent_terminal(cfg: dict, oid: str, sid: str, directory: str) -> bool:
+    """Open a terminal window on the agent - or a tab in its repository's window.
+
+    Best effort only: the agent is already running on the server by this point, so a
+    failure here costs nothing but the view - it is logged, and the order still succeeds.
     """
     w = cfg.get("watch", {})
     if not w.get("launch_terminal", True):
@@ -1097,7 +1217,26 @@ def open_agent_terminal(cfg: dict, oid: str, sid: str, directory: str) -> bool:
     directory = os.path.expanduser(directory)
     opencode_bin = os.path.expanduser(w.get("opencode_bin") or "opencode")
     title = "%s - %s" % (oid, os.path.basename(directory.rstrip("/")) or directory)
-    fname = write_terminal_script(oid, sid, directory, title, opencode_bin)
+    write_terminal_script(oid, sid, directory, title, opencode_bin)
+    fname = os.path.join(TERMINALS_DIR, "%s.sh" % sid)
+
+    if w.get("tabs", True) and tmux_binary():
+        slug = tmux_session_name(directory)
+        fname = write_tab_script(oid, sid, directory, title, slug)
+        if tmux("has-session", "-t", slug)[0] == 0:
+            # this repository already has its window: the order becomes a tab in it
+            rc, out = tmux("new-window", "-t", slug, "-n", window_name(oid),
+                           "bash %s" % shlex.quote(os.path.join(TERMINALS_DIR, "%s.sh" % sid)))
+            if rc != 0:
+                log("  could not add a tab for %s to %s: %s" % (oid, slug, out.strip()))
+            else:
+                tmux("select-window", "-t", "%s:%s" % (slug, window_name(oid)))
+                if tmux("list-clients", "-t", slug)[1].strip():
+                    log("  opened a tab for %s in the %s window" % (oid, slug))
+                    return True
+                # its window was closed by hand and the tabs live on, detached
+                log("  the %s window was gone - re-attaching it to its tabs" % slug)
+
     one_arg = "bash %s" % shlex.quote(fname)
 
     template = w.get("terminal")
@@ -1125,16 +1264,35 @@ def open_agent_terminal(cfg: dict, oid: str, sid: str, directory: str) -> bool:
     return False
 
 
-def agent_windows(windows: list[dict] | None = None) -> list[dict]:
-    """Every terminal window this watcher opened: [{"pid","sid","script"}].
+def agent_windows(windows: list[dict] | None = None,
+                  st: dict | None = None) -> list[dict]:
+    """Every view an agent is running in: [{"pid","sid","script","tmux"}].
 
-    Only windows running one of our own terminal scripts count, so the user's windows
-    are never touched.  Read from /proc rather than pgrep on purpose: a pgrep pattern
-    matches the command line of the shell that is looking for it, and kills it.
+    Two places to look, because a repository now has one window for all of its orders:
+
+    * the repository's tmux session - one entry per tab, which is the only way to see an
+      order whose tab shares somebody else's window, and the only way to see the tabs of a
+      session whose window was closed by hand (the agents keep running, detached);
+    * ``/proc``, for terminal windows still running one of our own scripts - a window opened
+      with ``tabs: false``, or before tabs existed.  Read from /proc rather than pgrep on
+      purpose: a pgrep pattern matches the command line of the shell looking for it, and
+      kills it.
     """
     if windows is not None:
         return windows
     out: list[dict] = []
+    seen: set[str] = set()
+    sessions = (st or {}).get("sessions") or {}
+    rev = {window_name(oid): oid for oid in sessions}
+    for slug in tmux_sessions():
+        for name in tmux_tabs(slug):
+            oid = rev.get(name)
+            if oid is None:
+                continue                    # not one of our orders - leave it alone
+            sid = sessions[oid]
+            out.append({"pid": 0, "sid": sid, "script": script_path(sid),
+                        "tmux": "%s:%s" % (slug, name)})
+            seen.add(sid)
     pat = re.compile(re.escape(TERMINALS_DIR) + r"/[^\s\"']+\.sh")
     for name in os.listdir("/proc"):
         if not name.isdigit():
@@ -1148,8 +1306,12 @@ def agent_windows(windows: list[dict] | None = None) -> list[dict]:
         if not m:
             continue
         script = m.group(0)
-        out.append({"pid": int(name), "sid": os.path.basename(script)[:-3],
-                    "script": script})
+        sid = os.path.basename(script)[:-3]
+        if sid.startswith("tab-"):
+            sid = sid[4:]                   # the window script of a repository's tabs
+        if sid in seen:
+            continue
+        out.append({"pid": int(name), "sid": sid, "script": script, "tmux": None})
     return out
 
 
@@ -1168,13 +1330,17 @@ def _close_window(pid: int, script: str) -> None:
 def reap_windows(cfg: dict, st: dict, activity: list[dict] | None = None,
                  force: bool = False, dry_run: bool = False,
                  windows: list[dict] | None = None) -> list[str]:
-    """Close the windows of agents that are not working, so idle TUIs stop holding memory.
+    """Close the views of agents that are not working, so idle TUIs stop holding memory.
 
-    ``force`` (what ``watcher.sh reap`` asks for) closes every agent window that is not
-    working right now.  Otherwise a window goes only once its agent has been quiet for
-    ``reap_idle_seconds`` and the window itself is at least that old - closing eagerly
-    would close the very window a 48 minute test run is sitting in.  An agent parked on
-    a question is never closed either: that window is where the answer is typed.
+    ``force`` (what ``watcher.sh reap`` asks for) closes every agent view that is not
+    working right now.  Otherwise a view goes only once its agent has been quiet for
+    ``reap_idle_seconds`` and the view itself is at least that old - closing eagerly
+    would close the very tab a 48 minute test run is sitting in.  An agent parked on
+    a question is never closed either: that view is where the answer is typed.
+
+    A tab is closed through its tmux session, which kills the agent's TUI with it - and
+    the last tab takes the repository's window with it.  That also reaches the tabs whose
+    window was closed by hand: nobody is looking at them, but they are still running.
     """
     w = cfg.get("watch") or {}
     if dry_run or not w.get("launch_terminal", True):
@@ -1187,7 +1353,7 @@ def reap_windows(cfg: dict, st: dict, activity: list[dict] | None = None,
     done = set(st.get("finished") or {})
     waiting = set(st.get("waiting") or {})
     closed: list[str] = []
-    for win in agent_windows(windows):
+    for win in agent_windows(windows, st):
         oid = by_sid.get(win["sid"])
         if oid is None or oid in closed:
             continue                        # not one of ours - leave it alone
@@ -1195,23 +1361,29 @@ def reap_windows(cfg: dict, st: dict, activity: list[dict] | None = None,
             continue                        # it asked a question: that is where it is answered
         a = act.get(oid) or {}
         if a.get("live") and oid not in done:
-            continue                        # it is working: never close its window
+            continue                        # it is working: never close its view
         age = now - os.path.getmtime(win["script"]) if os.path.exists(win["script"]) else 0
         idle = (now - a["last"]) if a.get("last") else 0
         if not force and age < idle_after and idle < idle_after:
             continue
-        try:
-            _close_window(win["pid"], win["script"])
-        except Exception as e:
-            log("  could not close the window for %s: %s" % (oid, e))
-            continue
-        try:
-            os.remove(win["script"])
-        except Exception:
-            pass
-        log("  closed the window for %s (%s) - its agent is not working"
-            % (oid, "you asked" if force
-               else "quiet for over %d min" % int(idle_after // 60)))
+        how = ("you asked" if force
+               else "quiet for over %d min" % int(idle_after // 60))
+        if win.get("tmux"):
+            if not close_tab(win["tmux"]):
+                continue
+            log("  closed the tab for %s (%s) - its agent is not working" % (oid, how))
+        else:
+            try:
+                _close_window(win["pid"], win["script"])
+            except Exception as e:
+                log("  could not close the window for %s: %s" % (oid, e))
+                continue
+            log("  closed the window for %s (%s) - its agent is not working" % (oid, how))
+        for p in (win["script"], os.path.join(TERMINALS_DIR, "%s.sh" % win["sid"])):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
         closed.append(oid)
     return closed
 

@@ -438,29 +438,44 @@ repo you are not looking at is therefore invisible in whichever `opencode` windo
 open — the session is on the same server, just in another project's list.
 
 **So the watcher opens the window for you.** When it starts an agent it also launches a
-terminal in the order's directory, attached to that agent's session, titled
-`<order> - <repo>`:
+terminal in the order's directory, attached to that agent's session.
+
+**One window per repository, one tab per work order.** Orders pile up in the same repo, and
+a window each fills the desktop with near-identical windows — five orders in `~/projects`
+were five qterminal windows, all titled `... - projects`. So a repository gets **one** window
+and each order is a **tab** in it:
 
 ```
-WO-105 - my-api         a qterminal window running:  opencode -s ses_e39bc84...
+agents - projects            a window whose tabs are:  WO-105  WO-118  WO-120
 ```
 
-A work order is never silent background work any more. The window is opened *after* the
-session is already running, and only as a nicety: if it cannot open (no display, no
-terminal emulator installed) the order still goes ahead and the log says so.
+The tabs come from a **tmux session** named after the repository (`cb-<repo>-<hash>`), because
+qterminal 2.4.0 cannot open a tab in a window that is already up - it has no flag for it and
+no D-Bus service to ask, and no other terminal emulator is installed. Move between tabs with
+`Ctrl-b n` / `Ctrl-b p`, or just click one (`mouse on` is set for these sessions); the status
+line says so. Closing the repository's window keeps the agents running, and the next order in
+that repo brings the window back with every tab intact.
+
+A work order is never silent background work: the second and later orders in a repository are
+tabs in a window that is already on screen, and the first one opens the window. Opening is
+*after* the session is already running, and only as a nicety: if it cannot open (no display,
+no terminal, no tmux) the order still goes ahead and the log says so.
 
 Settings in `config.json`, under `watch`:
 
 | setting | default | meaning |
 |---|---|---|
-| `launch_terminal` | `true` | open a terminal window per work order; `false` = background only |
+| `launch_terminal` | `true` | open a terminal for each work order; `false` = background only |
+| `tabs` | `true` | group a repository's orders as tabs in one window (needs `tmux`); `false` = one window per order, as before |
 | `terminal` | auto-detect | template to force one, e.g. `["qterminal", "-w", "{dir}", "-e", "{cmd}"]`. Placeholders: `{dir}`, `{cmd}` (command as one argument), `{file}` (launcher script) |
 
-Each window runs a small generated script, `terminals/<session>.sh`, which `cd`s to the
-repo, sets the window title and `exec`s `opencode -s <session>` — read it if you ever wonder
-what a window is doing. Auto-detect takes the first of: qterminal, xfce4-terminal, kitty,
-alacritty, wezterm, konsole, gnome-terminal, kgx, ptyxis, foot, tilix, mate-terminal,
-lxterminal, xterm. What it launched is logged in `terminal.log`.
+Two tiny generated scripts per order explain what a window is doing. `terminals/<session>.sh`
+`cd`s to the repo, sets the title and `exec`s `opencode -s <session>` — the agent itself.
+`terminals/tab-<session>.sh` is what the *window* runs under `tabs: true`: it attaches to the
+repository's tmux session, or creates it with this order as its first tab. Auto-detect takes
+the first of: qterminal, xfce4-terminal, kitty, alacritty, wezterm, konsole, gnome-terminal,
+kgx, ptyxis, foot, tilix, mate-terminal, lxterminal, xterm. What it launched is logged in
+`terminal.log`.
 
 ### Watching from where you already are
 
@@ -534,14 +549,17 @@ The loop now expects this and deals with it:
   will answer it), and is bounded to `resume_max` per order with one per
   `resume_cooldown_seconds`, `resume_max_per_pass` at a time - a reboot must not fire up
   every agent that ever ran.
-* **The windows left behind are closed.** An idle agent's window costs 150-250 MB for
-  nothing. `watcher.sh reap` closes every agent window that is not working; on its own the
-  watcher closes one once its agent has been quiet for `reap_idle_seconds` (2 h). A working
-  agent's window is never closed, and neither is any window the watcher did not open.
+* **The views left behind are closed.** An idle agent's TUI costs 150-250 MB for nothing.
+  `watcher.sh reap` closes every agent view that is not working; on its own the watcher
+  closes one once its agent has been quiet for `reap_idle_seconds` (2 h). A tab is closed
+  through its tmux session, which kills the agent's TUI with it, and the last tab takes the
+  repository's window with it. That also reaches the tabs whose window was closed by hand:
+  nobody is looking at them, but the same session is still running them. A working agent's
+  view is never closed, and neither is any window the watcher did not open.
 
 ```bash
 ~/claude-bridge/watcher.sh status        # what is running: working / idle / waiting for you / resumed
-~/claude-bridge/watcher.sh reap          # close the windows of agents that are not working
+~/claude-bridge/watcher.sh reap          # close the views of agents that are not working
 ~/claude-bridge/watcher.sh done WO-111   # it reported DONE: free its slot, stop resuming it
 ```
 
@@ -561,7 +579,7 @@ DONE (see "The report that frees its own slot" above).
 | `resume_max_per_pass` | `2` | how many orders may be resumed in one pass |
 | `resume_cooldown_seconds` | `1800` | never resume the same order twice inside this |
 | `resume_max_age_seconds` | `21600` | a session quiet longer than this is over, not interrupted |
-| `reap_idle_seconds` | `7200` | close an agent's window after this long of quiet |
+| `reap_idle_seconds` | `7200` | close an agent's view (its tab, or its window) after this long of quiet |
 | `agent_active_seconds` | `1800` | the transcript moving inside this window means "working" |
 
 If you would rather systemd owned the server than the watcher, `contrib/opencode.service`
@@ -662,7 +680,7 @@ How the bridge handles it:
 | `watcher.py` | polls the chat for work orders and starts agents on them |
 | `watcher.sh` | start / stop / status the watcher |
 | `agent-watch.py` | follow a running work-order agent live from any terminal |
-| `terminals/` | the tiny per-session launcher script each agent window runs |
+| `terminals/` | the tiny generated launcher scripts each agent's view runs (`<session>.sh` the agent itself, `tab-<session>.sh` the per-repository window) |
 | `start-bridge-chrome.sh` | launches/reuses the dedicated bridge Chrome window |
 | `bridge-up.sh` | after a restart: bridge window + sign-in check + watcher, in one go |
 | `config.json` | remembered `chat_url` + the `watch` settings |
