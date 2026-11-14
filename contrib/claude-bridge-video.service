@@ -12,7 +12,9 @@
 #
 # It reads the `spare` account's chat and does nothing until that window is signed in - it
 # never falls back to the coding chat.  Sign in once with:
-#   ~/claude-bridge/start-bridge-chrome.sh --account spare
+#   CLAUDE_BRIDGE_ACCOUNT=spare bash ~/claude-bridge/start-bridge-chrome.sh
+# (the account goes in the environment, not as an argument; or run bridge-up.sh with this
+# unit's CLAUDE_BRIDGE_HOME set, which reads the account from the home's own config)
 #
 # The two units are alternatives, not companions, to `watcher.sh start` for their own home:
 # each watcher takes its own home's watcher.lock, so a second one for the same home refuses
