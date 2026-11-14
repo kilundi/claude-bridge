@@ -34,20 +34,28 @@ sys.path.insert(0, HERE)
 
 import wlock  # noqa: E402
 from bridge import (Bridge, ClaudeUnavailable, cdp_alive, ensure_chrome,  # noqa: E402
-                    extract_work_orders, order_problems, outbox_files, queue_message)
+                    extract_work_orders, order_problems, outbox_files, queue_message,
+                    UP_SCRIPT)
 
-CONFIG = os.path.join(HERE, "config.json")
-STATE = os.path.join(HERE, "state.json")
-INBOX = os.path.join(HERE, "inbox")
-LOG = os.path.join(HERE, "watcher.log")
-TERMINAL_LOG = os.path.join(HERE, "terminal.log")
-LOCK = os.path.join(HERE, "watcher.lock")
-DOWNLOADS = os.path.join(HERE, "downloads")
+# The watcher's own home: its config, state, log, lock, inbox and reports.  A second
+# watcher - a separate pipeline beside the coding loop - sets CLAUDE_BRIDGE_HOME to its own
+# directory, and the two then share nothing: no lock, no queue, no state, no chat, no
+# slots.  Unset, HOME is HERE and every path below is exactly what it has always been, so
+# the coding loop cannot be changed by this existing.
+HOME = os.path.abspath(os.path.expanduser(os.environ.get("CLAUDE_BRIDGE_HOME") or HERE))
+
+CONFIG = os.path.join(HOME, "config.json")
+STATE = os.path.join(HOME, "state.json")
+INBOX = os.path.join(HOME, "inbox")
+LOG = os.path.join(HOME, "watcher.log")
+TERMINAL_LOG = os.path.join(HOME, "terminal.log")
+LOCK = os.path.join(HOME, "watcher.lock")
+DOWNLOADS = os.path.join(HOME, "downloads")
 # where an agent leaves its DONE report; the file appearing is what frees the order's
 # slot without anybody having to read the report first
-REPORTS = os.path.join(HERE, "reports")
+REPORTS = os.path.join(HOME, "reports")
 # written when a turn is stalled and Claude did not answer the one automatic ask
-NEEDS_ORDER = os.path.join(HERE, "NEEDS-ORDER.md")
+NEEDS_ORDER = os.path.join(HOME, "NEEDS-ORDER.md")
 # where the opencode background server registers itself (pid, url, password)
 SERVICE_JSON = os.path.expanduser("~/.local/state/opencode/service.json")
 
@@ -97,6 +105,20 @@ def quiet(st: dict, why: str) -> None:
     if nudge.get("last_wait") != why:
         nudge["last_wait"] = why
         log("  %s" % why)
+
+
+def bridge_down_advice() -> str:
+    """What to run when the bridge window is down - pointed at *this* pipeline's home.
+
+    A second pipeline has its own Chrome, on its own account: the advice must carry its
+    home, or the launcher it names would bring up the *other* pipeline's window.  For the
+    coding loop, whose home is the checkout itself, the command is plain, as always.
+    """
+    how = "bash %s" % UP_SCRIPT
+    if HOME != HERE:
+        how = "CLAUDE_BRIDGE_HOME=%s %s" % (HOME, how)
+    return ("bridge window is down, so work orders cannot be picked up. "
+            "Run: %s  (or tell an agent to launch the bridge)" % how)
 
 
 def load_state() -> dict:
@@ -1145,6 +1167,8 @@ def order_to_inbox(order: dict, files: list[dict]) -> str:
     body = ["# Work order %s" % order["id"], ""]
     if order.get("dir"):
         body.append("dir: %s" % order["dir"])
+    if order.get("session"):
+        body.append("session: %s (delivered into this session, not a fresh one)" % order["session"])
     if order.get("branch"):
         body.append("branch: %s" % order["branch"])
     if order.get("save"):
@@ -1179,6 +1203,11 @@ def order_to_inbox(order: dict, files: list[dict]) -> str:
 
 def build_prompt(order: dict, files: list[dict], inbox_path: str) -> str:
     lines = ["Work order %s from Claude, received over the claude-bridge chat queue." % order["id"], ""]
+    if order.get("session"):
+        lines.append("This order was delivered into your existing session (%s), not a fresh"
+                     % order["session"])
+        lines.append("one - carry on from what you already know about this project.")
+        lines.append("")
     if order.get("dir"):
         lines.append("Repository: %s" % order["dir"])
     if order.get("branch"):
@@ -1232,6 +1261,26 @@ def build_prompt(order: dict, files: list[dict], inbox_path: str) -> str:
 def start_agent(cfg: dict, order: dict, files: list[dict], inbox_path: str) -> str:
     w = cfg.get("watch", {})
     binp = os.path.expanduser(w.get("opencode_bin") or "~/.opencode/bin/opencode")
+    prompt: dict = {"text": build_prompt(order, files, inbox_path)}
+    if files:
+        prompt["files"] = [{"uri": "file://" + f["path"], "name": f["name"]} for f in files]
+
+    pinned = (order.get("session") or "").strip()
+    if pinned:
+        # A pinned order is delivered *into* the session it named; no session is created.
+        # That session already carries its own directory and model, which is why the order
+        # was not asked for a directory (see bridge.order_problems).
+        #
+        # There is deliberately no fallback: an order pinned to a pipeline's working session
+        # must land there or the order fails visibly.  Quietly starting it in a fresh session
+        # elsewhere is the one outcome nobody would notice, and the whole point of pinning.
+        info = oc_api(binp, "GET", "/api/session/%s" % pinned, timeout=30)
+        data = info.get("data") if isinstance(info, dict) else None
+        if not isinstance(data, dict) or data.get("_tag") or data.get("id") != pinned:
+            raise RuntimeError("the pinned session is gone: %s" % str(info)[:300])
+        oc_api(binp, "POST", "/api/session/%s/prompt" % pinned, prompt, timeout=180)
+        return pinned
+
     directory = os.path.expanduser(order.get("dir") or w.get("default_dir") or "~")
     if not os.path.isdir(directory):
         raise RuntimeError("directory does not exist: %s" % directory)
@@ -1246,9 +1295,6 @@ def start_agent(cfg: dict, order: dict, files: list[dict], inbox_path: str) -> s
     sid = (created.get("data") or created).get("id")
     if not sid:
         raise RuntimeError("could not create session: %s" % str(created)[:300])
-    prompt: dict = {"text": build_prompt(order, files, inbox_path)}
-    if files:
-        prompt["files"] = [{"uri": "file://" + f["path"], "name": f["name"]} for f in files]
     oc_api(binp, "POST", "/api/session/%s/prompt" % sid, prompt, timeout=180)
     return sid
 
@@ -1854,10 +1900,13 @@ def ensure_started(cfg: dict, st: dict, oid: str, delay: float | None = None) ->
         rec["last_error"] = None
         rec["updated"] = time.time()
         save_state(st)
-        log("  started opencode session %s in %s"
-            % (sid, order.get("dir") or watch.get("default_dir")))
-        open_agent_terminal(cfg, oid, sid,
-                            order.get("dir") or watch.get("default_dir") or "~")
+        where = order.get("dir") or watch.get("default_dir") or "~"
+        if (order.get("session") or "").strip():
+            log("  delivered %s into the pinned session %s - no new session was created"
+                % (oid, sid))
+        else:
+            log("  started opencode session %s in %s" % (sid, where))
+        open_agent_terminal(cfg, oid, sid, where)
         return sid
     return None
 
@@ -1975,8 +2024,7 @@ def pass_once(cfg: dict, st: dict, dry_run: bool = False) -> dict:
             log("bridge window was down - launched it")
         else:
             if st.get("bridge_up", True):  # only say it once, not every pass
-                log("bridge window is down, so work orders cannot be picked up. "
-                    "Run: bash ~/claude-bridge/bridge-up.sh  (or tell an agent to launch the bridge)")
+                log(bridge_down_advice())
                 st["bridge_up"] = False
                 save_state(st)
             return st

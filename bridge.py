@@ -39,6 +39,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+# Where the bridge keeps its *data*: the config, the pinned tab, the outbox, the drafts,
+# the downloads, the watcher's pid and lock.  Deliberately not the same question as HERE
+# (where the *code* is), because one checkout can drive more than one pipeline: a second
+# loop - its own chat, its own queue, its own state - sets CLAUDE_BRIDGE_HOME to its own
+# directory and shares nothing with the first.  Unset, HOME is HERE, so every path below
+# lands exactly where it always has.
+HOME = os.path.abspath(os.path.expanduser(os.environ.get("CLAUDE_BRIDGE_HOME") or HERE))
+
 from wlock import locked_by_other  # noqa: E402  (same-directory helper)
 
 HOST = os.environ.get("CLAUDE_BRIDGE_HOST", "127.0.0.1")
@@ -50,12 +58,12 @@ BASE = f"http://{HOST}:{PORT}"
 DEFAULT_TIMEOUT = float(os.environ.get("CLAUDE_BRIDGE_TIMEOUT", "600"))
 LAUNCHER = os.path.join(HERE, "start-bridge-chrome.sh")
 UP_SCRIPT = os.path.join(HERE, "bridge-up.sh")
-CONFIG_PATH = os.path.join(HERE, "config.json")
+CONFIG_PATH = os.path.join(HOME, "config.json")
 # The pinned tab, and the profile/port/chat/base, are per *account*: they are set here and
 # then decided by use_account() from config.json (see "accounts" below).
 ACCOUNT = DEFAULT_ACCOUNT
 PROFILE = DEFAULT_PROFILE
-TARGET_PATH = os.path.join(HERE, "bridge-target.json")
+TARGET_PATH = os.path.join(HOME, "bridge-target.json")
 LEGACY_TARGET_PATH = TARGET_PATH          # the single pin a pre-accounts bridge wrote
 
 # The web UI has no /compact (its slash menu only lists skills), so "compact" is
@@ -75,7 +83,7 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
 MAX_ATTACH_FILES = 8
 MAX_ATTACH_BYTES = 20 * 1024 * 1024          # claude.ai's own ceiling is about 30 MB
 ATTACH_TIMEOUT = float(os.environ.get("CLAUDE_BRIDGE_ATTACH_TIMEOUT", "120"))
-DRAFTS = os.path.join(HERE, "drafts")
+DRAFTS = os.path.join(HOME, "drafts")
 
 
 class ClaudeUnavailable(RuntimeError):
@@ -173,7 +181,7 @@ def image_paths(items, newest_first: bool = True) -> list[str]:
     return uniq
 
 
-OUTBOX = os.path.join(HERE, "outbox")
+OUTBOX = os.path.join(HOME, "outbox")
 
 
 def queue_message(text: str, reason: str = "") -> str:
@@ -313,7 +321,7 @@ def account_spec(name: str | None = None, cfg: dict | None = None) -> dict:
 
 def target_path_for(name: str) -> str:
     """One pinned-tab file per account: a pin on the spare is not a pin on main."""
-    return os.path.join(HERE, "bridge-target-%s.json" % name)
+    return os.path.join(HOME, "bridge-target-%s.json" % name)
 
 
 def port_alive(port: int) -> bool:
@@ -527,12 +535,12 @@ def start_bridge() -> dict:
             out["chat"] = st.get("url")
         except Exception as e:
             out["detail"] += f" (state: {e})"
-    pid_file = os.path.join(HERE, "watcher.pid")
+    pid_file = os.path.join(HOME, "watcher.pid")
     # The watcher is "up" when some process holds watcher.lock - the same lock
     # watcher.sh and watcher.py take.  This is what stops two simultaneous starts
     # from both bringing a watcher up; the pid file is kept as a fallback for an
     # older watcher that predates the lock.
-    lock_path = os.path.join(HERE, "watcher.lock")
+    lock_path = os.path.join(HOME, "watcher.lock")
     out["watcher"] = locked_by_other(lock_path)
     if not out["watcher"] and os.path.exists(pid_file):
         try:
@@ -961,6 +969,11 @@ WORK_ORDER_FENCE = re.compile(r"```+[ \t]*work[-_ ]?order[ \t]*\n(.*?)(?:```+|$)
 ORDER_FIELD_LINE = re.compile(
     r"^[ \t]*(?:[-*][ \t]*|\d+[.)][ \t]*)?(?:#+[ \t]*)?([A-Za-z][A-Za-z _-]{0,24}?)[ \t]*[:=][ \t]*(.*)$")
 ORDER_ID_VALUE = re.compile(r"^WO-\d+$", re.I)
+# A pinned order names the opencode session it goes to instead of a directory.  Checked
+# here only for shape - a mangled paste (the `ses_` prefix lost, a stray character) is worth
+# asking back rather than starting.  An id that is well-formed but simply wrong is settled at
+# dispatch, where the session is looked up (see start_agent's pinned branch).
+ORDER_SESSION_VALUE = re.compile(r"^ses_[A-Za-z0-9]+$")
 LOOSE_MIN_FIELDS = 3
 
 # What an order must carry before it is worth handing to an agent.  Everything
@@ -1073,6 +1086,9 @@ def extract_work_orders(text: str) -> list[dict]:
     Extraction is deliberately *not* validation: an order missing its dir or its
     acceptance test is still returned, so the watcher can say what is missing
     instead of dropping it.  See ``order_problems``.
+
+    A ``session:`` line in place of ``dir:`` marks a **pinned** order: it is
+    delivered into that opencode session instead of starting a fresh one.
     """
     if not text:
         return []
@@ -1098,6 +1114,12 @@ def extract_work_orders(text: str) -> list[dict]:
             "id": wid,
             "goal": goal,
             "dir": fields.get("dir") or fields.get("directory") or fields.get("repo") or fields.get("project") or "",
+            # an order may name the session it belongs to instead of a directory: it is
+            # delivered *into* that session rather than started in a fresh one.  This is
+            # how a pipeline with one long-lived working session (video work beside the
+            # coding loop) gets its orders, without a second way of writing them.
+            "session": (fields.get("session") or fields.get("session_id")
+                        or fields.get("in_session") or "").strip(),
             "branch": fields.get("branch") or "",
             "save": fields.get("save") or fields.get("save_to") or fields.get("output") or fields.get("path") or "",
             "acceptance": fields.get("acceptance") or fields.get("done_when") or fields.get("done") or "",
@@ -1113,13 +1135,23 @@ def order_problems(order: dict) -> list[str]:
     Returns [] for a complete order.  This is the watcher's guarantee that a
     half-written order never becomes a half-informed agent: whatever is listed
     here is asked back from Claude, once.
+
+    A **pinned** order - one that names the session it is delivered into - is the
+    exception to the dir rule: that session already has its own directory, so the
+    order is not asked for one it will never use.  Its session id is checked for
+    shape only.
     """
+    pinned = (order.get("session") or "").strip()
     problems: list[str] = []
     for name in REQUIRED_ORDER_FIELDS:
+        if name == "dir" and pinned:
+            continue
         if not (order.get(name) or "").strip():
             problems.append(name)
+    if pinned and not ORDER_SESSION_VALUE.match(pinned):
+        problems.append("session (not an opencode session id: %s)" % pinned)
     where = (order.get("dir") or "").strip()
-    if where:
+    if where and not pinned:
         where = os.path.expanduser(where)
         if not os.path.isabs(where):
             problems.append("dir (must be an absolute path)")
@@ -1402,7 +1434,7 @@ class Bridge:
         match may be a string (substring of the card title), a list of titles, or
         None for every card.
         """
-        outdir = os.path.join(HERE, "downloads")
+        outdir = os.path.join(HOME, "downloads")
         os.makedirs(outdir, exist_ok=True)
         c = self.connect(want_composer=False)
         try:

@@ -6,8 +6,14 @@
 #   ./watcher.sh done WO-111        it reported DONE: free its agent slot now
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-PID="$HERE/watcher.pid"
-LOCK="$HERE/watcher.lock"
+# The *code* is here; the pid, the lock and the logs live in the *home*.  A second pipeline
+# (see CLAUDE_BRIDGE_HOME) has its own home and its own unit and shares nothing with the
+# first - which is what keeps two loops from ever contending for one lock.  Unset, the home
+# is HERE, exactly as before.
+HOME_DIR="${CLAUDE_BRIDGE_HOME:-$HERE}"
+UNIT="${CLAUDE_BRIDGE_UNIT:-claude-bridge-watcher}"
+PID="$HOME_DIR/watcher.pid"
+LOCK="$HOME_DIR/watcher.lock"
 CMD="${1:-status}"
 
 running() { [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null; }
@@ -33,13 +39,14 @@ case "$CMD" in
     exec python3 "$HERE/watcher.py"
     ;;
   start)
+    mkdir -p "$HOME_DIR"
     if running; then echo "watcher already running (pid $(cat "$PID"))"; exit 0; fi
     # Take the same lock the watcher itself takes, so two simultaneous starts
     # cannot both launch one.  fd 9 is inherited by the watcher, which holds the
     # lock for its whole life; when this shell exits the child keeps it.
     exec 9>"$LOCK"
     if ! flock -n 9; then echo "watcher already running (watcher.lock is held)"; exit 0; fi
-    WATCHER_LOCK_FD=9 setsid nohup python3 "$HERE/watcher.py" >>"$HERE/watcher.out" 2>&1 &
+    WATCHER_LOCK_FD=9 setsid nohup python3 "$HERE/watcher.py" >>"$HOME_DIR/watcher.out" 2>&1 &
     echo $! >"$PID"
     sleep 1
     if running; then echo "watcher started (pid $(cat "$PID"))"; else echo "watcher failed to start - see $HERE/watcher.log"; exit 1; fi
@@ -48,7 +55,7 @@ case "$CMD" in
     if running; then kill "$(cat "$PID")" 2>/dev/null; rm -f "$PID"; echo "watcher stopped"
     elif supervised; then
       echo "a supervisor owns this watcher - stop it there:"
-      echo "  systemctl --user stop claude-bridge-watcher"
+      echo "  systemctl --user stop $UNIT"
       exit 1
     else echo "watcher not running"; rm -f "$PID"; fi
     ;;
@@ -56,8 +63,8 @@ case "$CMD" in
     # A restart is not a stop+start when a supervisor owns the process: systemd has to do
     # the replacing, or it would see its unit's process vanish and start a second one.
     if supervised; then
-      systemctl --user restart claude-bridge-watcher && sleep 2 \
-        && echo "watcher restarted (systemd user unit, pid $(systemctl --user show -p MainPID --value claude-bridge-watcher))"
+      systemctl --user restart "$UNIT" && sleep 2 \
+        && echo "watcher restarted (systemd user unit, pid $(systemctl --user show -p MainPID --value "$UNIT"))"
     else
       "$0" stop
       "$0" start
@@ -70,14 +77,14 @@ case "$CMD" in
     ;;
   status)
     if running; then echo "watcher running (pid $(cat "$PID"))"
-    elif supervised; then echo "watcher running (started by a supervisor: systemctl --user status claude-bridge-watcher)"
+    elif supervised; then echo "watcher running (started by a supervisor: systemctl --user status $UNIT)"
     else echo "watcher not running"; fi
     python3 "$HERE/watcher.py" --status 2>/dev/null || echo "  (could not read the agents)"
-    if [ -f "$HERE/NEEDS-ORDER.md" ]; then
-      echo "STALLED: the queue needs an order from Claude - see $HERE/NEEDS-ORDER.md"
+    if [ -f "$HOME_DIR/NEEDS-ORDER.md" ]; then
+      echo "STALLED: the queue needs an order from Claude - see $HOME_DIR/NEEDS-ORDER.md"
     fi
     echo "--- last log lines ---"
-    tail -n 8 "$HERE/watcher.log" 2>/dev/null || echo "(no log yet)"
+    tail -n 8 "$HOME_DIR/watcher.log" 2>/dev/null || echo "(no log yet)"
     ;;
   reap)
     # Close the windows of agents that are not working.  Safe beside the watcher:

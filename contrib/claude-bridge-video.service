@@ -1,0 +1,45 @@
+# The video pipeline's watcher - the coding loop's twin, sharing nothing with it.
+#
+# The coding loop (contrib/claude-bridge-watcher.service) must never be interrupted by video
+# work, so video gets its own loop rather than a queue in that one: its own home, its own
+# state, its own lock, its own Claude account, its own agent cap and memory floor.
+# CLAUDE_BRIDGE_HOME is what moves the watcher's data; the code stays in one checkout.
+#
+#   systemctl --user link ~/claude-bridge/contrib/claude-bridge-video.service
+#   systemctl --user enable --now claude-bridge-video
+#   systemctl --user status claude-bridge-video
+#   journalctl --user -u claude-bridge-video -n 50
+#
+# It reads the `spare` account's chat and does nothing until that window is signed in - it
+# never falls back to the coding chat.  Sign in once with:
+#   ~/claude-bridge/start-bridge-chrome.sh --account spare
+#
+# The two units are alternatives, not companions, to `watcher.sh start` for their own home:
+# each watcher takes its own home's watcher.lock, so a second one for the same home refuses
+# to start instead of running a duplicate loop.
+
+[Unit]
+Description=claude-bridge video watcher (video work orders into the video session)
+Documentation=file:%h/claude-bridge-video/README.md
+After=graphical-session.target
+PartOf=graphical-session.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/claude-bridge
+ExecStart=%h/claude-bridge/watcher.sh run
+# this is the whole separation: the data home, and the unit name `watcher.sh` talks to
+Environment=CLAUDE_BRIDGE_HOME=%h/claude-bridge-video
+Environment=CLAUDE_BRIDGE_UNIT=claude-bridge-video
+# it never touches the agents it started: a watcher restart is not an agent restart
+KillMode=process
+Restart=on-failure
+RestartSec=15
+Environment=DISPLAY=:0
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

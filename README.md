@@ -301,6 +301,7 @@ or a fenced ```` ```work-order ```` block. Fields:
 |-------|---------|
 | `id` | new each time; a repeated id with the same text is treated as already done |
 | `dir` | the repository the agent works in (falls back to `watch.default_dir`) |
+| `session` | optional `ses_...`: deliver the order **into** that session instead of starting one — the session's own directory and model apply, so such an order needs no `dir` (see "A second pipeline") |
 | `branch` | the branch the agent commits and pushes to |
 | `goal` | what to do |
 | `acceptance` | how we know it is done |
@@ -789,6 +790,66 @@ planner: spare account -> https://claude.ai/chat/bbbbbbbb-5555-6666-7777-8888888
 
 ---
 
+## A second pipeline: video work beside the coding loop
+
+An account is one way to keep two kinds of work apart; a **home** is the other, and it is the
+stronger one. `CLAUDE_BRIDGE_HOME` moves the watcher's and the bridge's *data* - config,
+state, log, lock, inbox, reports, outbox - to another directory, and a second watcher started
+from it shares **nothing** with the first: no lock, no queue, no state, no chat, no agent
+slots. That is what lets a video loop run beside the coding loop without the coding loop ever
+being interrupted by it. The code stays in one checkout; only the data moves. Unset, every
+path is exactly what it always was.
+
+The video loop as it is set up here:
+
+```
+~/claude-bridge-video/          its own config, state, log, lock, inbox, reports, outbox
+  config.json                   active_account: spare · max_agents: 1 · min_free_mb: 1500
+```
+
+```bash
+# one call, no service: status / start / stop of the video loop
+CLAUDE_BRIDGE_HOME=~/claude-bridge-video ~/claude-bridge/watcher.sh status
+
+# as a service, so it comes back after a reboot like the coding loop does
+systemctl --user link ~/claude-bridge/contrib/claude-bridge-video.service
+systemctl --user enable --now claude-bridge-video
+
+# bring its window up and check the sign-in (it reads the `spare` account)
+CLAUDE_BRIDGE_HOME=~/claude-bridge-video bash ~/claude-bridge/bridge-up.sh
+```
+
+The two numbers in its `watch` block are the point. **`max_agents: 1`** gives video its own
+slot, so a video agent can never occupy one of the coding loop's two. **`min_free_mb: 1500`**
+is higher than the coding loop's 800 - the floor the coding loop *rejected* as too cautious is
+exactly the right one here, because here a held order is the point: video waits while memory is
+tight and the coding loop keeps its headroom.
+
+Its orders name the session they are delivered into instead of a directory:
+
+```
+<<<WORK-ORDER
+id: WO-160
+session: ses_e2a758dc0ffe6naxYQwxm0YXpF
+goal: cut episode 0003 together
+acceptance: episodes/0003 renders and the words line up
+>>>
+```
+
+Such an order is **pinned**: the watcher prompts that session - the session's own directory and
+model apply, so the order needs no `dir:` and is not asked for one. No new session is ever
+created for a pinned order, and if the session is gone the order **fails visibly** rather than
+quietly starting somewhere else. Everything downstream is the ordinary machinery: the DONE
+report, the waiting mark, the visible window, the slot. A pipeline whose work lives in one
+long-running session uses this instead of a directory per order.
+
+The account is how the two loops stay apart in the browser too: the video loop reads the
+`spare` account's chat (port 9223), the coding loop reads `main`'s (port 9222). A spare that
+has never been signed in resolves to its **own** `claude.ai/new`, never to the coding chat -
+so until you sign it in, the video loop simply finds nothing to do.
+
+---
+
 ## Long conversations and `/compact`
 
 The user's habit for long threads is to run **`/compact`** on Claude so the
@@ -830,12 +891,14 @@ How the bridge handles it:
 | `watcher.py` | polls the chat for work orders and starts agents on them |
 | `watcher.sh` | start / stop / status the watcher (`run` = foreground, for the unit below) |
 | `contrib/claude-bridge-watcher.service` | the systemd user unit that brings the watcher back after a reboot (and on failure) |
+| `contrib/claude-bridge-video.service` | the same for the **video** loop - `CLAUDE_BRIDGE_HOME=~/claude-bridge-video`, the `spare` account, its own queue and slot |
 | `contrib/opencode.service` | optional systemd user unit for the opencode background server (the watcher supervises it by default) |
 | `agent-watch.py` | follow a running work-order agent live from any terminal |
 | `terminals/` | the tiny generated launcher scripts each agent's view runs (`<session>.sh` the agent itself, `tab-<session>.sh` the per-repository window) |
 | `start-bridge-chrome.sh` | launches/reuses the dedicated bridge Chrome window (for one account: `CLAUDE_BRIDGE_ACCOUNT=spare`) |
 | `bridge-up.sh` | after a restart: the active account's window + sign-in check + watcher, in one go |
 | `config.json` | `accounts` (profile, port, chat per account), `active_account`, and the `watch` settings |
+| `CLAUDE_BRIDGE_HOME` | the data home: set it to run a second, separate loop from the same code (`~/claude-bridge-video` is the video one) |
 | `bridge-target-<account>.json` | the claude.ai tab the bridge drives for that account (so extra tabs cannot steal a message) |
 | `inbox/` | work orders Claude has handed over (`<id>.md`) |
 | `downloads/` | file cards fetched from the chat |
