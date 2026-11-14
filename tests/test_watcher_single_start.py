@@ -59,7 +59,8 @@ def fake_start(cfg, order, files, inbox_path):
 watcher.start_agent = fake_start
 watcher.open_agent_terminal = lambda cfg_, oid, sid, directory: False
 watcher.session_activity = lambda cfg_, st_, now=None: []
-cfg = {"watch": {"auto_start": True, "start_retries": 2, "start_retry_delay": 0}}
+cfg = {"watch": {"auto_start": True, "start_retries": 2, "start_retry_delay": 0,
+                 "min_free_mb": 0}}    # this machine's free memory must not decide the proof
 order = json.loads(os.environ["CB_ORDER"])
 
 while not os.path.exists(os.environ["CB_GO"]):   # line up on the same instant
@@ -96,7 +97,10 @@ def tmp_env() -> str:
 
 
 def cfg(delay: float = 0) -> dict:
-    return {"watch": {"auto_start": True, "start_retries": 2, "start_retry_delay": delay}}
+    # min_free_mb 0: the free-memory floor is real in production, but a proof must not depend
+    # on how much memory this machine happens to have (the proof about the floor sets it)
+    return {"watch": {"auto_start": True, "start_retries": 2, "start_retry_delay": delay,
+                      "min_free_mb": 0}}
 
 
 def count_lines(path: str) -> int:

@@ -119,7 +119,8 @@ def tmp_env() -> str:
 
 def cfg(**watch) -> dict:
     base = {"launch_terminal": True, "tabs": True, "reap_idle_seconds": 7200,
-            "opencode_bin": "/usr/bin/opencode"}
+            "opencode_bin": "/usr/bin/opencode",
+            "min_free_mb": 0}   # never let this machine's memory decide a proof
     base.update(watch)
     return {"watch": base}
 

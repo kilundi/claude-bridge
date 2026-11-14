@@ -555,9 +555,33 @@ The loop now expects this and deals with it:
   This is not theory: on 2026-11-11 five sessions held a cap of two for 35 minutes, because
   a restart-resume moved each clock and the old rule counted a clock. One of them was
   working.
+* **And memory is a floor of its own (`min_free_mb`, default 800).** A cap counts agents,
+  not gigabytes, and one `jest --runInBand` peaks near 1.8 GB: two agents are fine or fatal
+  depending on what they happen to be running. Before starting anything the watcher reads
+  `MemAvailable`; below the floor it holds the order unmarked (so a later pass starts it the
+  moment memory frees), logs why, and `status` says `waiting for free memory` rather than
+  `a free agent slot`. An agent that is already running is never touched - a turn in flight
+  is work, and killing it to save memory is how work is lost. `0` turns the floor off.
+
+  **800, not the 1500 this started as:** measured here, one agent plus Chrome routinely
+  leaves ~0.6-1.2 GB, so 1500 held orders while the box had room for one more - and a held
+  order is a stalled queue, which the list above ranks *worse* than memory pressure. 800 is
+  three times the ~246 MiB the server actually died at, and `max_agents` is what bounds the
+  total. Raise it if the machine is ever busy with something else; the read is of
+  `MemAvailable`, not free memory, so page cache counts.
 * **The server comes back once, not in a stampede.** The watcher is the single owner: if the
   registered pid is gone it runs `opencode service start` itself (at most once a minute),
   and it never touches a live server.
+* **And a probe is not a second starter.** Every `opencode api` call made while the service
+  is down starts a *client* that tries to bring a service up, and a new service replaces the
+  registered one — *"managed service registration replaced; shutting down"*, 11-11. The
+  watcher probes every session on every pass, so a down service used to be hit again and
+  again: 187 `Background service failed to start` lines in five minutes that evening, 94 in
+  two minutes on 11-13, and 39 pid changes of which only **5** were the watcher's. Now the
+  first failure stops the probing for two minutes (the supervisor's one start is the only
+  one), and each replacement is attributed in the log and kept in the last five, which
+  `status` prints:
+  `the opencode background server was restarted (503718 -> 513005) by something else (an opencode client started its own; the watcher did not)`.
 * **The turns it interrupted are resumed.** A restart (noticed by the pid changing) makes
   the watcher re-prompt the agents that were stopped: *"your previous turn was interrupted
   ... `git status && git log` first ... do NOT redo committed work ... carry on, then report
@@ -579,8 +603,21 @@ The loop now expects this and deals with it:
 ```bash
 ~/claude-bridge/watcher.sh status        # what is running: working / idle / waiting for you / resumed
 ~/claude-bridge/watcher.sh reap          # close the views of agents that are not working
+~/claude-bridge/watcher.sh restart       # stop and start (through systemd, when it owns the watcher)
 ~/claude-bridge/watcher.sh done WO-111   # it reported DONE: free its slot, stop resuming it
 ```
+
+`status` also names the views we own - every tab and window, with how long its agent has been
+quiet, so "who is on screen" needs no `pgrep` and `tmux ls`:
+
+```
+views: 2 open
+  WO-158  tab cb-wms-web-e5557712:WO-158            agent last moved 3 min ago
+  WO-130  window pid 1460868                        agent last moved 1414 min ago
+```
+
+and it prints the memory reading against the floor and the last service replacement (who did
+it), because those are the two things that decide whether the queue moves.
 
 `status` also says **waiting for you** for an agent that has parked a question and is holding
 no slot. `done` is the override for the times neither report signal fires - an agent that
@@ -590,6 +627,7 @@ DONE (see "The report that frees its own slot" above).
 | setting | default | meaning |
 |---|---|---|
 | `max_agents` | `2` | how many agents may run at once; `0` = no cap |
+| `min_free_mb` | `800` | free memory (`MemAvailable`) an order needs before its agent starts; `0` = no floor |
 | `slot_seconds` | `3600` | the backstop: a slot is freed after this even if a turn seems to be running |
 | `slot_probe_seconds` | `120` | quiet for less than this, a session keeps its slot without being asked |
 | `service_start_cooldown` | `60` | at most one `opencode service start` this often |
@@ -600,6 +638,7 @@ DONE (see "The report that frees its own slot" above).
 | `resume_max_age_seconds` | `21600` | a session quiet longer than this is over, not interrupted |
 | `reap_idle_seconds` | `7200` | close an agent's view (its tab, or its window) once its agent has been quiet this long *and* the view is this old |
 | `agent_active_seconds` | `1800` | the transcript moving inside this window means "working" |
+| `state_keep_days` | `7` | drop the start record of an order finished longer ago than this (the bulk of `state.json`); `watcher.sh prune-state` does it on demand |
 
 If you would rather systemd owned the server than the watcher, `contrib/opencode.service`
 is a user unit for it (`systemctl --user enable --now opencode`); set `max_agents` and
@@ -622,6 +661,10 @@ systemctl --user status claude-bridge-watcher
 means a watcher restart never touches the agents it started, and `DISPLAY` is set in the unit
 because opening a terminal window needs it (change that one line if your session is on
 another display). `sudo loginctl enable-linger $USER` makes it start before you log in.
+
+The unit sends the watcher's stdout to the journal (`journalctl --user -u claude-bridge-watcher
+-n 50`) and **not** to `watcher.log`: the watcher writes that file itself, and pointing both at
+it duplicated every line.
 
 With the unit running there is no `watcher.pid` to read, so `watcher.sh status` treats a held
 `watcher.lock` as a running watcher and says a supervisor owns it; `watcher.sh stop` says the

@@ -82,11 +82,20 @@ out of memory**, which outranks **noise**.
   in-flight turn in it; on 11-13 the same signature ("Background service failed to start") appears
   in the log right before the reboot at 16:28. The cap is `max_agents: 2`, which says nothing
   about how big those two happen to be.
-- **Close with.** Before starting an agent, read `MemAvailable`; below a floor
-  (`min_free_mb`, ~1500) do not start — hold the order, say so loudly in the log, show it in
-  `status`, and let the next pass try again. An agent that is already running is never touched.
-- **Proof.** A unit proof with a stubbed memory reader: below the floor nothing starts and the
-  line is logged; at or above it the order starts; the held order starts on a later pass.
+- **Done.** `min_free_mb` (default **800**, `0` = off) is read from `MemAvailable` before any
+  order starts; below the floor the order is held unmarked, the log says what it read, and
+  `status` prints `memory: 412 MB available (min_free_mb=800) - below the floor: no new agent
+  will start` and counts that order as `waiting for free memory`. An agent already running is
+  never touched. A failed reading (`/proc/meminfo` unreadable) never holds work.
+- **The number changed while building it.** The plan guessed ~1500, and on this box that held
+  orders while one agent plus Chrome still left ~1.0-1.2 GB free — a stalled queue, which this
+  list ranks *above* memory pressure. 800 is three times the ~246 MiB the background server
+  actually died at, and `max_agents` bounds the total. It is one config value, so it can be
+  raised without touching code; `status` shows the live reading on every call.
+- **Proof.** `test_low_memory_holds_new_agents`: held below the floor with the line logged and
+  the status rows checked, started on the first pass after memory frees, off at `0`, and
+  never holding on an unreadable reading. The suite's own config sets `min_free_mb: 0`, so no
+  other proof depends on how much memory this machine happens to have.
 
 ### 6. The background service is replaced — and killed — more often than it should be
 
@@ -95,22 +104,50 @@ out of memory**, which outranks **noise**.
   "could not read WO-x's session record: Background service failed to start" plus CLI stack traces
   land in `watcher.log`. A replacement kills in-flight turns, which the resume logic then papers
   over — so it is invisible unless you count pids.
-- **Close with.** Find out whether it is the watcher's own supervision or the CLI reaping it,
-  then make a replacement calm and observable: never replace a *live* service, log one line when
-  the pid changes, and record the reason. Acceptance: a full day of work with no unexplained
-  replacement and no turn killed by one.
+- **Done, and the answer was not the watcher.** Of the 39 pid changes on record, only 5 were
+  the watcher's own start (`service.started`); the other 34 were *clients* — every
+  `opencode api` call made while the service is down starts a client that tries to bring one
+  up, and a new service replaces the registered one. The watcher probes every session every
+  pass, so it *was* a herd of starters: 187 `Background service failed to start` lines in five
+  minutes on 11-11, 94 in two on 11-13. Now the first failure stops the probing for
+  `SERVICE_DOWN_MEMO` (120 s) — the supervisor's one start a minute is the only one — the
+  recovery is logged, and repeated per-order lines collapse through `log_once`.
+- **Observable replacement.** Each change is attributed (`by the watcher (it found no live
+  server)` vs `by something else (an opencode client started its own...)`) and kept in the
+  last five in `state.service.changes`; `status` prints the last one.
+- **Proof.** `test_a_probe_never_starts_a_second_service` (four probes against a down service
+  = one CLI call, one log line, recovery noticed) and `test_a_replacement_says_who_did_it`
+  (attribution both ways, the five-deep ring, the status line).
+- **Still open.** The remaining replacements are the CLI's own doing and cannot be fixed from
+  here: the acceptance ("a full day with no unexplained replacement") is now *measurable* —
+  `status` names the last one and who caused it — so the next day of work will say whether
+  anything else is at play.
 
 ---
 
 ## P3 — noise and papercuts
 
-7. **`is no longer in the chat` 125 times.** Say it once per order, not once per pass.
-8. **`watcher.sh` has no `restart`.** I keep doing `stop` + `start` by hand.
-9. **`status` never shows the views.** Which windows/tabs we own, their tab names and ages, would
-   make "who is on screen" answerable without `pgrep` + `tmux ls`.
-10. **`state.json` keeps everything.** 188 KB over 45 orders is fine, but a `prune` for orders
-    finished more than a week ago (keeping `finished`, dropping their `starts` order text) would
-    stop it growing without limit.
+7. **`is no longer in the chat` 125 times.** *Done.* `log_once` says it once per order per six
+   hours, and the deeper cause is fixed too: a `waiting` mark (an agent parked on a question)
+   is no longer dropped just because the order's message scrolled out of the chat — the question
+   is answered in that agent's *window*, so the mark is what keeps the window from being reaped.
+   It goes only when there is no session left to be parked in. The 312 `could not read ...
+   session record` lines go through the same helper. Proofs: `test_a_repeated_line_is_said_once`,
+   and `test_a_stale_wait_is_not_reported_as_waiting` now checks the reasons and the kept mark.
+8. **`watcher.sh` has no `restart`.** *Done:*
+   `start|stop|restart|status|log|reap|run|prune-state|done`. `restart` goes through
+   `systemctl --user restart` when the unit owns the watcher — a plain stop+start would make
+   systemd see its process vanish and start a second one.
+9. **`status` never shows the views.** *Done:* `views: N open`, then one line per view (`tab
+   <session>:<order>` or `window pid <n>`), with how long its agent has been quiet, from the same
+   `agent_windows` the reap pass uses. Proof: `test_status_shows_the_views_we_own`.
+10. **`state.json` keeps everything.** *Done:* `state_keep_days` (7) drops the whole start record
+    of an order finished longer ago — the parsed order, its files and inbox path, which are only
+    ever needed to *prompt* an agent. `finished`, the hash marks in `orders` and the session
+    mapping stay, because they are still read. It runs every pass and on demand
+    (`watcher.sh prune-state`). Proof: `test_state_prunes_only_old_finished_orders`.
+    *Nothing is dropped yet:* all 40 finished orders are under four days old, so the file is
+    still ~189 KB — the trimming starts next week, and the ring is in the proof.
 
 Done, for the record: image attach, whole-page phone screenshots, one window per repository with a
 tab per order, tabs reaped through their tmux session (which also sweeps the detached ones), a

@@ -56,6 +56,18 @@ SERVICE_JSON = os.path.expanduser("~/.local/state/opencode/service.json")
 START_MAX_RETRIES = 2
 START_RETRY_DELAY = 5.0
 
+# Free memory (MemAvailable, MB) an order needs before its agent may start.  On by
+# default, because the failure it prevents is not a slow loop but a dead one: the
+# background server died at 246 MiB free on 11-11 and every in-flight turn died with it.
+# A config.json value of 0 turns the guard off.
+#
+# 800 and not the 1500 this plan first guessed: measured on this box, one agent plus
+# Chrome routinely leaves ~1.0-1.2 GB, so 1500 held orders while the box had room for one
+# more, and a held order is a stalled queue - the thing this list ranks *above* memory
+# pressure.  800 is three times the level the server actually died at, and the cap (two
+# agents) is what keeps the total bounded.
+DEFAULT_MIN_FREE_MB = 800
+
 # set once in main(); holding it for the whole run is what makes a second
 # watcher refuse to start (see wlock.py)
 _LOCK_FD: int | None = None
@@ -164,16 +176,91 @@ def _hash(text: str) -> str:
 
 
 def oc_api(binpath: str, method: str, path: str, payload: dict | None = None, timeout: int = 60):
+    if service_down_seconds_left() > 0:
+        # Every `opencode api` call with the service down spawns a client that tries to bring
+        # a service *up*, and a new service replaces the registered one - so a pass that probes
+        # every session is a herd of starters, which is the opposite of the one-starter design.
+        raise RuntimeError("the background service is down: %s" % (_SERVICE_DOWN.get("why") or ""))
     cmd = [binpath, "api", method, path]
     if payload is not None:
         cmd += ["-d", json.dumps(payload)]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if p.returncode != 0:
+        text = (p.stdout or "") + (p.stderr or "")
+        if "Background service failed to start" in text:
+            note_service_down(text)
         raise RuntimeError("opencode api failed: %s%s" % (p.stdout[:300], p.stderr[:300]))
     try:
         return json.loads(p.stdout)
     except Exception:
         return {"raw": p.stdout}
+
+
+# The service is not answering, and for this long no further call may spawn a starter.  Short
+# on purpose: a recovered service must be noticed by itself, without anything being restarted
+# to find out.
+SERVICE_DOWN_MEMO = 120.0
+_SERVICE_DOWN: dict = {}
+
+
+def service_down_seconds_left(now: float | None = None) -> float:
+    if not _SERVICE_DOWN:
+        return 0.0
+    left = SERVICE_DOWN_MEMO - ((now or time.time()) - float(_SERVICE_DOWN.get("at") or 0))
+    return max(0.0, left)
+
+
+def note_service_down(text: str = "") -> None:
+    """Remember that the service is down, so no more calls this pass spawn a starter.
+
+    The watcher is the *one* starter by design (see :func:`ensure_service`), but every
+    ``opencode api`` call with the service down starts a client that tries to bring one up,
+    and a new service replaces the registered one - which is written in the 11-11 log:
+    *"managed service registration replaced; shutting down"*.  The watcher probed every
+    session on every pass: 187 ``Background service failed to start`` lines in five minutes
+    that evening, 94 in two minutes on 11-13, and 39 pid changes of which only 5 were ours.
+    A probe must not be a second starter.  Loud on the way in, and at most one line each
+    ten minutes while it lasts.
+    """
+    fresh = not _SERVICE_DOWN
+    _SERVICE_DOWN["at"] = time.time()
+    _SERVICE_DOWN["why"] = " ".join((text or "").split())[:160] or "the API did not answer"
+    if fresh:
+        log("the opencode background service is not answering (%s) - not probing anything "
+            "further for %ds, so that no client starts a second one; the supervisor starts "
+            "at most one a minute" % (_SERVICE_DOWN["why"], int(SERVICE_DOWN_MEMO)))
+    else:
+        log_once("service-still-down",
+                 "the opencode background service is still down (%s)" % _SERVICE_DOWN["why"],
+                 every=600)
+
+
+def service_recovered() -> None:
+    """Forget the outage: the service answers, so calls may try again."""
+    if _SERVICE_DOWN:
+        log("the opencode background service is answering again")
+    _SERVICE_DOWN.clear()
+
+
+# Log lines that would otherwise repeat every pass, keyed by what they are about.
+_SAID: dict[str, float] = {}
+
+
+def log_once(key: str, msg: str, every: float = 1800.0,
+             now: float | None = None) -> None:
+    """Say a thing once per ``every`` seconds per key, not once per pass.
+
+    The log held 312 ``could not read ... session record`` lines and 125 ``is no longer in
+    the chat`` lines, all of them the same fact about the same order repeated on every
+    pass.  A log that repeats itself is a log nobody reads, which is how a real failure
+    gets missed.
+    """
+    at = now or time.time()
+    last = _SAID.get(key)
+    if last is not None and at - last < every:
+        return
+    _SAID[key] = at
+    log(msg)
 
 
 # --- order quality: never start an agent on half a brief -----------------------------
@@ -350,6 +437,29 @@ def note_service(st: dict, dry_run: bool = False) -> dict | None:
     return None
 
 
+def explain_service_restart(st: dict, change: dict) -> str:
+    """Say whether the watcher started this server or something else replaced it.
+
+    The pid changing is the expensive event - every in-flight turn dies with the old
+    server - and for months the log said only that it happened.  Of the 39 changes on
+    record only 5 were ours (``service.started``: the watcher's one-per-cooldown start),
+    so the useful question is which it was, and only the state can answer it.
+    """
+    started = float((st.get("service") or {}).get("started") or 0)
+    if started and abs(time.time() - started) <= 180:
+        return "by the watcher (it found no live server)"
+    return "by something else (an opencode client started its own; the watcher did not)"
+
+
+def record_service_change(st: dict, change: dict, why: str) -> None:
+    """Keep the last few replacements, with the reason, so `status` can explain today's."""
+    rec = st.setdefault("service", {})
+    ring = rec.setdefault("changes", [])
+    ring.append({"at": time.time(), "from": change.get("from"), "to": change.get("to"),
+                 "why": why})
+    del ring[:-5]
+
+
 def _pid_alive(pid: int) -> bool:
     """Is this pid a process that still exists?"""
     try:
@@ -370,6 +480,7 @@ def ensure_service(cfg: dict, st: dict, dry_run: bool = False) -> bool:
         return False
     pid = service_pid()
     if pid and _pid_alive(pid):
+        service_recovered()
         return False                           # alive - never interfere with it
     w = cfg.get("watch") or {}
     rec = st.setdefault("service", {})
@@ -377,14 +488,18 @@ def ensure_service(cfg: dict, st: dict, dry_run: bool = False) -> bool:
         return False
     rec["started"] = time.time()
     binp = os.path.expanduser(w.get("opencode_bin") or "~/.opencode/bin/opencode")
+    recovered = False
     try:
         p = subprocess.run([binp, "service", "start"], capture_output=True, text=True,
                            stdin=subprocess.DEVNULL, timeout=180)
         log("  the opencode background server was gone - started it (pid %s): %s"
             % (service_pid(), " ".join((p.stdout or p.stderr or "").split())[:160]))
+        recovered = True
     except Exception as e:
         log("  could not start the opencode background server: %s" % e)
         return False
+    if recovered:
+        service_recovered()
     return True
 
 
@@ -568,7 +683,10 @@ def session_activity(cfg: dict, st: dict, now: float | None = None) -> list[dict
         try:
             last = _moved_at(binp, sid)
         except Exception as e:
-            log("  could not read %s's session record: %s" % (oid, e))
+            # once per order per half hour, not once per order per pass: this line alone
+            # filled the log 312 times while the service was down
+            log_once("unreadable-%s" % oid,
+                     "  could not read %s's session record: %s" % (oid, e), every=1800)
         out.append({"order": oid, "session": sid, "last": last, "finished": oid in done,
                     "live": bool(last and now - last < window)})
     out.sort(key=lambda a: (starts.get(a["order"]) or {}).get("updated") or 0)
@@ -737,27 +855,105 @@ def resume_stalled(cfg: dict, st: dict, activity: list[dict], restarted: dict | 
     return out
 
 
-def prune_marks(st: dict, orders: list[dict]) -> list[str]:
+def prune_marks(st: dict, orders: list[dict],
+                activity: list[dict] | None = None) -> list[tuple[str, str]]:
     """Drop the held and waiting markers that are no longer a real wait.
 
     Both are recomputed every pass from the transcript, so only the markers for orders
-    read *this* pass and still open survive.  Two kinds go: an order that is no longer
-    in the chat's own transcript (a held order is deliberately left unmarked in
-    ``orders`` so a later pass can still start it, but one that has scrolled out will
-    never be read again, and ``status`` showing it would be a lie about the queue), and
-    one that has since been marked finished.
+    read *this* pass and still open survive.  A **held** mark (an order waiting for a
+    slot) only means something while the order is still in the chat's own transcript: one
+    that has scrolled out will never be read again, and ``status`` showing it would be a
+    lie about the queue.
+
+    A **waiting** mark (an agent parked on a question) is not like that, and that is why
+    this reads the activity as well: the question is answered *in that agent's window*, so
+    the mark is what keeps the view from being reaped, and it is still true after the
+    order's message has scrolled out of the chat.  It goes when there is no session left
+    to be parked in - or the order is finished (``note_waiting`` refuses to re-add that
+    one; a finish removes it).
+
+    Before this, one parked order whose message had scrolled out came back every single
+    pass - ``note_waiting`` re-added it from the live session, this dropped it as "no
+    longer in the chat", and the log said so 125 times.
+
+    Returns ``(order, why)`` pairs, for a log line that says the right reason.
     """
     here = {o["id"] for o in orders}
+    with_a_session = {a["order"] for a in (activity or [])}
     done = set(st.get("finished") or {})
-    gone: list[str] = []
+    gone: list[tuple[str, str]] = []
+    seen: set[str] = set()
     for key in ("held", "waiting"):
         marks = st.setdefault(key, {})
         for oid in list(marks):
-            if oid not in here or oid in done:
-                marks.pop(oid, None)
-                if oid not in gone:
-                    gone.append(oid)
+            why = None
+            if oid in done:
+                why = "finished"
+            elif oid not in here:
+                if key == "held":
+                    why = "no longer in the chat"
+                elif oid not in with_a_session:
+                    why = "no longer in the chat, and no session left to wait in"
+            if not why:
+                continue
+            marks.pop(oid, None)
+            if oid not in seen:
+                seen.add(oid)
+                gone.append((oid, why))
     return gone
+
+
+def free_memory_mb() -> int | None:
+    """What the kernel says a new process may have, in MB (``MemAvailable``).
+
+    ``MemAvailable`` and not ``MemFree``: page cache counts, and on this box that is the
+    difference between "180 MB" and "two gigabytes".  ``None`` means the reading failed -
+    the guard then holds nothing, because a broken ``/proc/meminfo`` must never stop work.
+    """
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        return None
+    return None
+
+
+def memory_holds(cfg: dict, st: dict, orders: list[dict]) -> bool:
+    """Hold these orders when free memory is under the floor, and say what it read.
+
+    Memory is what killed the background server on 11-11 (246 MiB free, and every
+    in-flight turn with it) and left the same signature in the log on 11-13, right before
+    the reboot.  ``max_agents`` counts *agents*, and one `jest --runInBand` peaks near
+    1.8 GB: two agents are fine or fatal depending on what they happen to be running, so
+    the count was never the whole guard.  ``min_free_mb`` (1500 by default, ``0`` turns it
+    off) is the rest of it.
+
+    An order held here is deliberately left unmarked, exactly like one held over the cap:
+    a later pass picks it up the moment memory frees.  An agent that is already running is
+    never touched - a turn in flight is work, and killing it to save memory is how work is
+    lost.
+    """
+    floor = int((cfg.get("watch") or {}).get("min_free_mb", DEFAULT_MIN_FREE_MB) or 0)
+    if floor <= 0 or not orders:
+        return False
+    avail = free_memory_mb()
+    if avail is None:
+        return False                     # unreadable: never hold work on a failed reading
+    st["memory"] = {"available_mb": avail, "floor_mb": floor, "at": time.time(),
+                    "holding": []}
+    if avail >= floor:
+        return False
+    holds = st.setdefault("held", {})
+    for o in orders:
+        if o["id"] not in holds:
+            log("holding %s: %d MB free is under min_free_mb=%d, and low memory is what "
+                "killed the background server and every turn in it on 11-11; it starts when "
+                "memory frees up" % (o["id"], avail, floor))
+        holds[o["id"]] = time.time()
+    st["memory"]["holding"] = [o["id"] for o in orders]
+    return True
 
 
 def dispatch_batch(cfg: dict, st: dict, orders: list[dict], dry_run: bool = False,
@@ -766,10 +962,16 @@ def dispatch_batch(cfg: dict, st: dict, orders: list[dict], dry_run: bool = Fals
 
     An order that has to wait is deliberately left unmarked in state, so the next pass
     sees it again and starts it the moment an agent frees a slot: nothing is dropped,
-    and the wait is visible in the log.  ``max_agents`` of 0 means no cap.
+    and the wait is visible in the log.  ``max_agents`` of 0 means no cap, and the
+    free-memory floor is checked first because it says nothing about how many agents
+    there are (:func:`memory_holds`).
     """
     cap = int((cfg.get("watch") or {}).get("max_agents") or 0)
-    if cap <= 0 or dry_run or not orders:
+    if dry_run or not orders:
+        return list(orders), []
+    if memory_holds(cfg, st, orders):
+        return [], list(orders)
+    if cap <= 0:
         return list(orders), []
     act = activity if activity is not None else session_activity(cfg, st)
     working = slot_agents(act, cfg, probe=turn_probe(cfg))
@@ -1273,6 +1475,42 @@ def open_agent_terminal(cfg: dict, oid: str, sid: str, directory: str) -> bool:
     return False
 
 
+def prune_state(st: dict, days: float = 7.0, now: float | None = None) -> dict:
+    """Drop what a finished order no longer needs, so state.json stops growing.
+
+    ``starts[<id>]`` keeps the whole parsed order - goal, acceptance and the raw text - plus
+    the inbox path and every downloaded file: everything needed to *prompt* an agent, which a
+    finished order never does again.  It is the bulk of the file (188 KB over 45 orders) and
+    it grows with every order, so an order finished more than ``state_keep_days`` ago loses
+    its whole start record.
+
+    What stays is what is still read: ``finished`` (the reap rule and ``status``), the hash in
+    ``orders`` (which stops a message still in the chat's lookback being dispatched twice) and
+    the session mapping (which is how a leftover tab is recognised as ours and reaped).
+
+    Nothing about a live order is touched, and neither is a recently finished one: the record
+    is what ``watcher.sh status`` and a person reading the state after a surprise would want.
+    Deleting it is also the safe move for the start path - ``ensure_started`` sees no record
+    and does nothing, where a record with a status it does not know could be started again.
+    """
+    now = now or time.time()
+    cutoff = now - float(days) * 86400
+    starts = st.get("starts") or {}
+    finished = st.get("finished") or {}
+    dropped: list[str] = []
+    freed = 0
+    for oid, at in list(finished.items()):
+        if float(at or 0) > cutoff:
+            continue                        # recent: keep everything about it
+        rec = starts.get(oid)
+        if rec is None:
+            continue
+        freed += len(json.dumps(rec))
+        starts.pop(oid, None)
+        dropped.append(oid)
+    return {"orders": sorted(dropped), "count": len(dropped), "bytes": freed}
+
+
 def agent_windows(windows: list[dict] | None = None,
                   st: dict | None = None) -> list[dict]:
     """Every view an agent is running in: [{"pid","sid","script","tmux"}].
@@ -1673,9 +1911,11 @@ def pass_once(cfg: dict, st: dict, dry_run: bool = False) -> dict:
                 restarted = {"from": rec.get("pid"), "to": pid}
             rec["pid"] = pid
     if restarted:
-        log("the opencode background server was restarted (%s -> %s) - checking whether "
+        why = explain_service_restart(st, restarted)
+        record_service_change(st, restarted, why)
+        log("the opencode background server was restarted (%s -> %s) %s - checking whether "
             "any running order lost its turn with it"
-            % (restarted.get("from"), restarted.get("to")))
+            % (restarted.get("from"), restarted.get("to"), why))
     activity = [] if dry_run else session_activity(cfg, st)
     verdicts: dict[str, str] = {}
     if activity:
@@ -1761,8 +2001,23 @@ def pass_once(cfg: dict, st: dict, dry_run: bool = False) -> dict:
         orders.extend(extract_work_orders(m))
     routed = route_orders(st, orders)
     new = routed["dispatch"]
-    for gone in prune_marks(st, orders):
-        log("%s is no longer in the chat - it is not waiting for anything any more" % gone)
+    # An order finished a week ago needs nothing but its `finished` mark, and its start
+    # record is the bulk of state.json.  Safe to do on every pass: it only ever touches
+    # records that are finished and old.
+    pruned = prune_state(st, days=float(cfg.get("watch", {}).get("state_keep_days", 7)))
+    if pruned["count"]:
+        log_once("state-pruned",
+                 "dropped the start record of %d order(s) finished more than %s day(s) ago "
+                 "(%d KB of state.json): %s"
+                 % (pruned["count"], cfg.get("watch", {}).get("state_keep_days", 7),
+                    pruned["bytes"] // 1024, ", ".join(pruned["orders"][:8])),
+                 every=24 * 3600)
+    for gone, why in prune_marks(st, orders, activity):
+        # once per order per six hours, not once per pass: this line alone said the same
+        # thing about the same order 125 times
+        log_once("gone-%s" % gone,
+                 "%s is %s - it is not waiting for anything any more" % (gone, why),
+                 every=6 * 3600)
 
     # Only the orders that fit under max_agents have their files pulled down now; a
     # held one is fetched when it starts, so a loaded machine does not do that work
@@ -1831,6 +2086,41 @@ def report_status(cfg: dict, st: dict) -> int:
     now = time.time()
     print("agents: %d of %s slots used (max_agents=%s)"
           % (len(slots), cap or "unlimited", cap or "none"))
+    floor = int(w.get("min_free_mb", DEFAULT_MIN_FREE_MB) or 0)
+    avail = free_memory_mb()
+    if floor > 0:
+        if avail is None:
+            print("memory: unreadable (/proc/meminfo) - the floor cannot hold anything")
+        else:
+            print("memory: %d MB available (min_free_mb=%d)%s"
+                  % (avail, floor, " - below the floor: no new agent will start"
+                     if avail < floor else ""))
+    svc = st.get("service") or {}
+    changes = list(svc.get("changes") or [])
+    if changes:
+        c = changes[-1]
+        print("service: pid %s, last replaced %s (%s -> %s)"
+              % (svc.get("pid"), time.strftime("%m-%d %H:%M", time.localtime(c.get("at") or 0)),
+                 c.get("from"), c.get("to")))
+        print("         %s" % c.get("why"))
+    elif svc.get("pid"):
+        print("service: pid %s (no replacement seen since this watcher started)" % svc.get("pid"))
+    # The views we own: which window or tab each agent is running in, and how long its agent
+    # has been quiet. "Who is on screen" should not need pgrep and tmux ls.
+    by_sid = {sid: oid for oid, sid in (st.get("sessions") or {}).items()}
+    last = {a["order"]: a.get("last") for a in act}
+    views = agent_windows(None, st)
+    if not views:
+        print("views: none open")
+    else:
+        print("views: %d open" % len(views))
+        for v in views:
+            oid = by_sid.get(v.get("sid"), v.get("sid") or "?")
+            where = ("tab %s" % v["tmux"]) if v.get("tmux") else ("window pid %s" % v.get("pid"))
+            age = last.get(oid)
+            quiet = ("agent last moved %.0f min ago" % ((now - age) / 60)) if age \
+                else "agent silent"
+            print("  %-7s %-40s %s" % (oid, where, quiet))
     for a in act:
         oid = a["order"]
         age = (now - a["last"]) if a.get("last") else None
@@ -1855,7 +2145,9 @@ def report_status(cfg: dict, st: dict) -> int:
     for oid in sorted((st.get("held") or {}).keys()):
         if oid in (st.get("starts") or {}):
             continue          # it started after all: a stale marker, not a wait
-        print("  %-7s waiting for a free agent slot" % oid)
+        why = "free memory" if oid in set((st.get("memory") or {}).get("holding") or []) \
+            else "a free agent slot"
+        print("  %-7s waiting for %s" % (oid, why))
     return 0
 
 
@@ -1870,6 +2162,9 @@ def main() -> int:
                     help="close the windows of agents that are not working, then exit")
     ap.add_argument("--finish", metavar="ORDER", default=None,
                     help="mark an order finished (frees its slot, stops any resume), then exit")
+    ap.add_argument("--prune-state", action="store_true",
+                    help="drop the start records of orders finished more than "
+                         "watch.state_keep_days (7) days ago, then exit")
     args = ap.parse_args()
     cfg = load_config()
 
@@ -1884,6 +2179,18 @@ def main() -> int:
         closed = reap_windows(cfg, load_state(), force=True)
         print("closed %d agent window(s)%s"
               % (len(closed), (": " + ", ".join(closed)) if closed else " - none was idle"))
+        return 0
+    if args.prune_state:
+        st = load_state()
+        days = float(cfg.get("watch", {}).get("state_keep_days", 7))
+        res = prune_state(st, days=days)
+        if res["count"]:
+            save_state(st)
+        print("dropped the start record of %d order(s) finished more than %s day(s) ago "
+              "(%d KB%s)%s"
+              % (res["count"], days, res["bytes"] // 1024,
+                 ", and state.json rewritten" if res["count"] else "",
+                 (": " + ", ".join(res["orders"][:10])) if res["orders"] else ""))
         return 0
     if args.status:
         return report_status(cfg, load_state())

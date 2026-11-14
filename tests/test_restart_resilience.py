@@ -32,6 +32,7 @@ import watcher  # noqa: E402
 # proofs ABOUT that reader call the real one through this reference.
 REAL_SESSION_ACTIVITY = watcher.session_activity
 REAL_TURN_VERDICT = watcher._turn_verdict
+REAL_AGENT_WINDOWS = watcher.agent_windows
 
 
 def tmp_env(tmp=None) -> str:
@@ -42,6 +43,10 @@ def tmp_env(tmp=None) -> str:
     watcher.DOWNLOADS = os.path.join(d, "downloads")
     watcher.NEEDS_ORDER = os.path.join(d, "NEEDS-ORDER.md")
     watcher.REPORTS = os.path.join(d, "reports")
+    # say-once bookkeeping and the down-service latch are process-wide: a proof must start
+    # from neither, or the first proof's lines hide the second proof's
+    watcher._SAID.clear()
+    watcher._SERVICE_DOWN.clear()
     # the outbox too: a report finished from its file alone is queued for the planner, and a
     # test must never put anything in the real one
     bridge.OUTBOX = os.path.join(d, "outbox")
@@ -53,6 +58,9 @@ def tmp_env(tmp=None) -> str:
     watcher.open_agent_terminal = lambda cfg_, oid, sid, directory: False
     watcher.session_activity = lambda cfg_, st_, now=None: []
     watcher._close_window = lambda pid, script: None
+    # a proof about the views stubs this; the real reader (tmux + /proc) comes back here, so
+    # one proof's stub can never decide another proof's answer
+    watcher.agent_windows = REAL_AGENT_WINDOWS
     # the transcript probe: "nobody could say", which must always hold a slot.  A proof
     # that is about it overrides this.
     watcher._turn_verdict = lambda binp, sid: None
@@ -64,7 +72,10 @@ def cfg(**watch) -> dict:
             "resume_interrupted": True, "resume_max": 3, "resume_max_per_pass": 2,
             "resume_cooldown_seconds": 1800, "resume_max_age_seconds": 21600,
             "reap_idle_seconds": 7200, "launch_terminal": True, "ask_for_order": True,
-            "start_retries": 0, "start_retry_delay": 0}
+            "start_retries": 0, "start_retry_delay": 0,
+            # the free-memory floor is 1500 in production; 0 here, so no proof depends on
+            # how much memory this machine happens to have.  The proof about it sets it.
+            "min_free_mb": 0}
     base.update(watch)
     return {"watch": base}
 
@@ -148,6 +159,221 @@ def test_slot_cap_holds_the_third() -> str:
     watcher.handle_orders(cfg(), st, [order("WO-303")], files=[])
     assert started == [], started
     return "2/2 slots full: the third order waits, unmarked, and is named in the log"
+
+
+def test_low_memory_holds_new_agents() -> str:
+    """11-11: 246 MiB free, the background server died, every in-flight turn with it.
+
+    `max_agents` counts agents; one `jest --runInBand` peaks near 1.8 GB, so two agents are
+    fine or fatal depending on what they are running.  Below `min_free_mb` nothing new
+    starts, the order is held unmarked, and `status` says which kind of wait it is.
+    """
+    tmp_env()
+    real = watcher.free_memory_mb
+    try:
+        watcher.free_memory_mb = lambda: 400
+        st = state()
+        batch, held = watcher.dispatch_batch(cfg(min_free_mb=1500), st, [order("WO-400")])
+        assert batch == [] and [o["id"] for o in held] == ["WO-400"], (batch, held)
+        assert st["held"]["WO-400"], st["held"]
+        assert st["memory"] == {"available_mb": 400, "floor_mb": 1500,
+                                "at": st["memory"]["at"], "holding": ["WO-400"]}, st["memory"]
+        assert "WO-400" not in st["orders"], "a held order stays unmarked, so a pass sees it"
+        logtext = open(watcher.LOG).read()
+        assert "holding WO-400: 400 MB free is under min_free_mb=1500" in logtext, logtext
+        # status names the wait: memory, not a slot
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            watcher.report_status(cfg(min_free_mb=1500), st)
+        out = buf.getvalue()
+        assert "memory: 400 MB available (min_free_mb=1500) - below the floor" in out, out
+        assert "WO-400  waiting for free memory" in out, out
+        # memory frees: the next pass starts it, with no cap involved
+        watcher.free_memory_mb = lambda: 3000
+        batch, held = watcher.dispatch_batch(cfg(min_free_mb=1500), st, [order("WO-400")])
+        assert [o["id"] for o in batch] == ["WO-400"] and held == [], (batch, held)
+        assert st["memory"]["holding"] == [], st["memory"]
+        # off by config, and never holding work on a reading that failed
+        watcher.free_memory_mb = lambda: 1
+        assert watcher.dispatch_batch(cfg(min_free_mb=0), st, [order("WO-401")])[0], \
+            "min_free_mb=0 is the guard switched off"
+        watcher.free_memory_mb = lambda: None
+        assert watcher.dispatch_batch(cfg(min_free_mb=1500), st, [order("WO-402")])[0], \
+            "an unreadable /proc/meminfo must never stop work"
+        # a real reading, so the parser is exercised at least once
+        watcher.free_memory_mb = real
+        assert (watcher.free_memory_mb() or 0) > 0, "MemAvailable is read from /proc/meminfo"
+    finally:
+        watcher.free_memory_mb = real
+    return ("under the floor nothing starts and the order waits unmarked, status says why, "
+            "and it starts on the first pass after memory frees")
+
+
+def test_a_probe_never_starts_a_second_service() -> str:
+    """39 pid changes on record, 5 of them the watcher's: the probes were the other starters.
+
+    Every ``opencode api`` call with the service down starts a client that tries to bring a
+    service *up*, and a new service replaces the registered one - "managed service
+    registration replaced; shutting down", 11-11.  One pass probed every session, so a down
+    service was hit again and again: 187 ``Background service failed to start`` lines in
+    five minutes that evening, 94 in two minutes on 11-13.
+    """
+    tmp_env()
+    calls: list[list[str]] = []
+
+    class Down:
+        returncode = 1
+        stdout = ""
+        stderr = "Error: Background service failed to start"
+
+    class Up:
+        returncode = 0
+        stdout = json.dumps({"data": {"time": {"updated": 1700000000000}}})
+        stderr = ""
+
+    real_run = watcher.subprocess.run
+    try:
+        watcher.subprocess.run = lambda cmd, **kw: (calls.append(cmd), Down())[1]
+        errors: list[str] = []
+        for sid in ("ses_1", "ses_2", "ses_3", "ses_4"):
+            try:
+                watcher._moved_at("/bin/true", sid)
+            except Exception as e:
+                errors.append(str(e))
+        assert len(calls) == 1, \
+            "four probes against a down service must not be four starters: %d" % len(calls)
+        assert len(errors) == 4 and "service is down" in errors[3], errors
+        logtext = open(watcher.LOG).read()
+        assert logtext.count("is not answering") == 1, "one line per outage, not per probe"
+        assert "no more calls may" not in logtext, logtext
+        # the service answers again (the supervisor's check says the pid is alive): probes
+        # may try again, and the recovery is said out loud
+        watcher.service_recovered()
+        watcher.subprocess.run = lambda cmd, **kw: (calls.append(cmd), Up())[1]
+        assert watcher._moved_at("/bin/true", "ses_1") == 1700000000.0
+        assert len(calls) == 2, calls
+        logtext = open(watcher.LOG).read()
+        assert "answering again" in logtext, logtext
+    finally:
+        watcher.subprocess.run = real_run
+        watcher._SERVICE_DOWN.clear()
+    return "a down service is probed once, not once per session, and recovery is noticed"
+
+
+def test_a_replacement_says_who_did_it() -> str:
+    """A pid change is the expensive event - every in-flight turn dies with the old server.
+
+    Recording that it happened is not enough: the useful question is whether the watcher
+    started it (it found no live server) or something else replaced it.  Only 5 of the 39
+    changes on record were ours.
+    """
+    tmp_env()
+    st = state()
+    st["service"] = {"pid": 111, "started": time.time() - 10}
+    change = {"from": 111, "to": 222}
+    assert "by the watcher" in watcher.explain_service_restart(st, change)
+    st["service"]["started"] = time.time() - 3600
+    assert "by something else" in watcher.explain_service_restart(st, change)
+    watcher.record_service_change(st, change, "by something else (an opencode client)")
+    assert st["service"]["changes"][-1] == {"at": st["service"]["changes"][-1]["at"],
+                                            "from": 111, "to": 222,
+                                            "why": "by something else (an opencode client)"}
+    for i in range(8):
+        watcher.record_service_change(st, {"from": i, "to": i + 1}, "x")
+    assert len(st["service"]["changes"]) == 5, "the ring keeps the last five"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        watcher.report_status(cfg(), st)
+    out = buf.getvalue()
+    assert "service: pid 111, last replaced" in out, out
+    return "a replacement is attributed in the log and kept in the last five, and status shows it"
+
+
+def test_status_shows_the_views_we_own() -> str:
+    """Which window or tab each agent is in should not need pgrep and tmux ls.
+
+    The answers were always in `agent_windows`, which the reap pass uses; `status` just never
+    asked, so "who is on screen" was a separate investigation every time.
+    """
+    tmp_env()
+    st = state(("WO-380", "ses_a", 60), ("WO-381", "ses_b", 3000))
+    watcher.session_activity = make_activity({"WO-380": 60, "WO-381": 3000})
+    watcher.agent_windows = lambda windows=None, s=None: [
+        {"pid": 0, "sid": "ses_a", "script": "/x/a.sh", "tmux": "cb-wms-web-1234abcd:WO-380"},
+        {"pid": 999, "sid": "ses_b", "script": "/x/b.sh", "tmux": None}]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        watcher.report_status(cfg(), st)
+    out = buf.getvalue()
+    assert "views: 2 open" in out, out
+    assert "WO-380  tab cb-wms-web-1234abcd:WO-380" in out, out
+    assert "agent last moved 1 min ago" in out, out
+    assert "WO-381  window pid 999" in out, out
+    assert "agent last moved 50 min ago" in out, out
+    # nothing open: say so, rather than print nothing and leave it ambiguous
+    watcher.agent_windows = lambda windows=None, s=None: []
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        watcher.report_status(cfg(), st)
+    assert "views: none open" in buf.getvalue(), buf.getvalue()
+    return "status names every tab and window we own, with how long its agent has been quiet"
+
+
+def test_state_prunes_only_old_finished_orders() -> str:
+    """188 KB of state.json over 45 orders, almost all of it start records nobody reads.
+
+    `starts[<id>]` holds the parsed order (goal, acceptance, raw text), the inbox path and
+    the downloaded files: what is needed to *prompt* an agent, which a finished order never
+    does again.  The proof is also about what must NOT go: a live order's record, a recently
+    finished one's, and the `finished`/`orders`/`sessions` marks that are still read.
+    """
+    tmp_env()
+    st = state(("WO-500", "ses_a", 60))
+    st["starts"]["WO-501"] = {"status": "started", "attempts": 1, "updated": time.time() - 9 * 86400,
+                              "order": order("WO-501"), "files": [{"path": "/tmp/x"}],
+                              "inbox": "/tmp/WO-501.md"}
+    st["starts"]["WO-502"] = {"status": "started", "attempts": 1, "updated": time.time() - 86400,
+                              "order": order("WO-502"), "files": [], "inbox": "/tmp/WO-502.md"}
+    st["sessions"]["WO-501"] = "ses_old"
+    st["finished"] = {"WO-501": time.time() - 9 * 86400, "WO-502": time.time() - 86400}
+    st["orders"] = {"WO-501": "hash1", "WO-502": "hash2"}
+    res = watcher.prune_state(st, days=7)
+    assert res["orders"] == ["WO-501"] and res["bytes"] > 0, res
+    assert "WO-501" not in st["starts"], "an old finished order's start record goes"
+    assert "WO-502" in st["starts"], "a finished order from yesterday keeps its record"
+    assert "WO-500" in st["starts"], "a live order is never touched"
+    assert sorted(st["finished"]) == ["WO-501", "WO-502"], "the finished marks stay"
+    assert st["orders"] == {"WO-501": "hash1", "WO-502": "hash2"}, \
+        "the hash marks stay: a message still in the chat must not be dispatched twice"
+    assert st["sessions"]["WO-501"] == "ses_old", \
+        "the session mapping stays: it is how a leftover tab is recognised as ours"
+    # idempotent, and a second pass over the same state changes nothing
+    assert watcher.prune_state(st, days=7) == {"orders": [], "count": 0, "bytes": 0}
+    # and it never touches a record that was never finished
+    st["starts"]["WO-503"] = {"status": "started", "updated": 1, "order": order("WO-503")}
+    assert watcher.prune_state(st, days=7)["count"] == 0
+    return "old finished start records go; live, recent, finished and hash marks all stay"
+
+
+def test_a_repeated_line_is_said_once() -> str:
+    """312 ``could not read`` and 125 ``no longer in the chat`` lines: the same fact per pass.
+
+    A log that repeats itself is a log nobody reads, and that is how a real failure gets
+    missed.  Once per order per window - and after the window it speaks again, so a failure
+    that lasts all day cannot hide behind its own first line.
+    """
+    tmp_env()
+    for _ in range(20):
+        watcher.log_once("unreadable-WO-1", "  could not read WO-1's session record: x",
+                         every=1800)
+    assert open(watcher.LOG).read().count("could not read WO-1") == 1
+    watcher.log_once("unreadable-WO-1", "  could not read WO-1's session record: x",
+                     every=1800, now=time.time() + 1801)
+    assert open(watcher.LOG).read().count("could not read WO-1") == 2
+    # different keys are independent: another order still gets its line
+    watcher.log_once("unreadable-WO-2", "  could not read WO-2's session record: x")
+    assert open(watcher.LOG).read().count("could not read WO-2") == 1
+    return "a line about one order is said once per window, and again after it"
 
 
 def test_cap_frees_a_slot_when_one_finishes() -> str:
@@ -823,9 +1049,13 @@ def test_a_stale_wait_is_not_reported_as_waiting() -> str:
     st["held"] = {"WO-390": time.time(), "WO-391": time.time(), "WO-392": time.time()}
     st["waiting"] = {"WO-393": time.time(), "WO-392": time.time()}
     st["finished"] = {"WO-392": time.time()}
-    # this pass read WO-391 only: WO-390 has scrolled out, WO-392 is already finished
+    # this pass read WO-391 only: WO-390 has scrolled out, WO-392 is already finished, and
+    # WO-393 is parked but has no session left (a parked order *with* a session keeps its
+    # mark - the question is answered in its window)
     gone = watcher.prune_marks(st, [order("WO-391")])
-    assert sorted(gone) == ["WO-390", "WO-392", "WO-393"], gone
+    assert sorted(gone) == [("WO-390", "no longer in the chat"),
+                            ("WO-392", "finished"),
+                            ("WO-393", "no longer in the chat, and no session left to wait in")], gone
     assert sorted(st["held"]) == ["WO-391"], st["held"]
     assert st["waiting"] == {}, st["waiting"]
     buf = io.StringIO()
@@ -833,6 +1063,12 @@ def test_a_stale_wait_is_not_reported_as_waiting() -> str:
         watcher.report_status(cfg(), st)
     assert "WO-391  waiting for a free agent slot" in buf.getvalue(), buf.getvalue()
     assert "WO-390" not in buf.getvalue() and "WO-392" not in buf.getvalue(), buf.getvalue()
+    # a parked order with a live session keeps its mark, so its window is not reaped
+    st["waiting"]["WO-394"] = time.time()
+    act = [{"order": "WO-394", "session": "ses_x", "last": time.time(), "finished": False,
+            "live": True}]
+    assert watcher.prune_marks(st, [order("WO-391")], act) == []
+    assert sorted(st["waiting"]) == ["WO-394"], st["waiting"]
     return "a wait the chat has moved past is dropped, so the queue in status is real"
 
 
@@ -883,6 +1119,12 @@ def test_status_says_what_is_running() -> str:
 def main() -> int:
     checks = [
         ("a cap holds the third agent", test_slot_cap_holds_the_third),
+        ("low memory holds instead", test_low_memory_holds_new_agents),
+        ("a probe is not a starter", test_a_probe_never_starts_a_second_service),
+        ("a replacement says who", test_a_replacement_says_who_did_it),
+        ("a repeated line is said once", test_a_repeated_line_is_said_once),
+        ("status names our views", test_status_shows_the_views_we_own),
+        ("only old finished state goes", test_state_prunes_only_old_finished_orders),
         ("a finished order frees its slot", test_cap_frees_a_slot_when_one_finishes),
         ("a long suite keeps its slot", test_a_long_suite_keeps_its_slot),
         ("a dead agent frees its slot", test_a_dead_agent_frees_its_slot),

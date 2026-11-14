@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Start, stop or check the claude-bridge work-order watcher.
-#   ./watcher.sh start|stop|status|log|reap
+#   ./watcher.sh start|stop|restart|status|log|reap
 #   ./watcher.sh run                foreground, for a supervisor (the systemd user unit)
+#   ./watcher.sh prune-state        drop the start records of orders finished over a week ago
 #   ./watcher.sh done WO-111        it reported DONE: free its agent slot now
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -17,7 +18,11 @@ running() { [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null; }
 supervised() {
   [ -f "$LOCK" ] || return 1
   exec 8>"$LOCK" 2>/dev/null || return 1
-  flock -n 8 && return 1                # we took the lock: nobody else holds it
+  if flock -n 8; then
+    exec 8>&-                           # we took the lock: nobody else holds it
+    return 1
+  fi
+  exec 8>&-                             # held by somebody else: drop our attempt
   return 0
 }
 
@@ -47,6 +52,22 @@ case "$CMD" in
       exit 1
     else echo "watcher not running"; rm -f "$PID"; fi
     ;;
+  restart)
+    # A restart is not a stop+start when a supervisor owns the process: systemd has to do
+    # the replacing, or it would see its unit's process vanish and start a second one.
+    if supervised; then
+      systemctl --user restart claude-bridge-watcher && sleep 2 \
+        && echo "watcher restarted (systemd user unit, pid $(systemctl --user show -p MainPID --value claude-bridge-watcher))"
+    else
+      "$0" stop
+      "$0" start
+    fi
+    ;;
+  prune-state)
+    # The start records of orders finished more than a week ago are the bulk of
+    # state.json; nothing reads them.  It happens on its own every pass, too.
+    python3 "$HERE/watcher.py" --prune-state
+    ;;
   status)
     if running; then echo "watcher running (pid $(cat "$PID"))"
     elif supervised; then echo "watcher running (started by a supervisor: systemctl --user status claude-bridge-watcher)"
@@ -71,5 +92,5 @@ case "$CMD" in
     tail -n 40 -f "$HERE/watcher.log"
     ;;
   *)
-    echo "usage: $0 {start|stop|status|log|reap|run|done <WORK-ORDER-ID>}"; exit 2;;
+    echo "usage: $0 {start|stop|restart|status|log|reap|run|prune-state|done <WORK-ORDER-ID>}"; exit 2;;
 esac

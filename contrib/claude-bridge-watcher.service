@@ -40,10 +40,12 @@ RestartSec=15
 # the display, so a restart can still open the window for an agent.  Change it if your
 # session is on another display (`echo $DISPLAY`).
 Environment=DISPLAY=:0
-# one file for everything: the watcher writes watcher.log itself, and this catches anything
-# that dies before it can (a Python traceback at import, say)
-StandardOutput=append:%h/claude-bridge/watcher.log
-StandardError=append:%h/claude-bridge/watcher.log
+# stdout goes to the journal, NOT to watcher.log: the watcher writes that file itself, and
+# pointing both at one file duplicated every line of it.  The journal is where a traceback
+# that never reached `log()` shows up:
+#   journalctl --user -u claude-bridge-watcher -n 50
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=default.target

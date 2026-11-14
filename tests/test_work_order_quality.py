@@ -68,7 +68,8 @@ def tmp_env() -> str:
 
 def cfg(**watch) -> dict:
     base = {"ask_for_order": True, "ask_max_streak": 1, "ask_grace_seconds": 600,
-            "ask_min_seconds": 120, "start_retries": 0, "start_retry_delay": 0}
+            "ask_min_seconds": 120, "start_retries": 0, "start_retry_delay": 0,
+            "min_free_mb": 0}   # never let this machine's memory decide a proof
     base.update(watch)
     return {"watch": base}
 
