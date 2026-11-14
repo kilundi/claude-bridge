@@ -3,9 +3,14 @@
 #
 #   ask-claude "status: done, pushed X. what next?"
 #   ask-claude --read          # print Claude's last message
-#   ask-claude --status        # bridge/page state
+#   ask-claude --status        # bridge/page state (names the account, chat and pinned tab)
 #   ask-claude --open          # make sure the bridge window is up
 #   ask-claude --available     # can Claude answer right now?
+#
+# More than one Claude account (each its own Chrome profile and chat):
+#   ask-claude --switch-account                # list the accounts, and which is active
+#   ask-claude --switch-account spare          # move the loop onto "spare"
+#   ask-claude --account spare --read          # one call on another account
 #
 # Reply text goes to stdout; diagnostics to stderr.
 #

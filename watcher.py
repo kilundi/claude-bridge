@@ -2120,6 +2120,14 @@ def report_status(cfg: dict, st: dict) -> int:
     now = time.time()
     print("agents: %d of %s slots used (max_agents=%s)"
           % (len(slots), cap or "unlimited", cap or "none"))
+    # Which planner the loop reports to.  The bridge resolves it from config.json once, so
+    # this is also the honest answer to "did the switch take?" - and it only prints when a
+    # config really names accounts, which keeps a proof's own config out of it.
+    accts = cfg.get("accounts") or {}
+    if accts:
+        who = str(cfg.get("active_account") or "main")
+        chat = str((accts.get(who) or {}).get("chat_url") or "")
+        print("planner: %s account%s" % (who, (" -> %s" % chat) if chat else " (no chat yet)"))
     floor = int(w.get("min_free_mb", DEFAULT_MIN_FREE_MB) or 0)
     avail = free_memory_mb()
     if floor > 0:

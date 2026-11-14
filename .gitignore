@@ -10,6 +10,7 @@
 config.json
 state.json
 bridge-target.json
+bridge-target-*.json
 PLAN-continuation-and-accounts.md
 watcher.log
 watcher.out

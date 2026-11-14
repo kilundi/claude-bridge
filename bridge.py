@@ -42,13 +42,21 @@ if HERE not in sys.path:
 from wlock import locked_by_other  # noqa: E402  (same-directory helper)
 
 HOST = os.environ.get("CLAUDE_BRIDGE_HOST", "127.0.0.1")
-PORT = int(os.environ.get("CLAUDE_BRIDGE_PORT", "9222"))
+DEFAULT_PORT = 9222
+DEFAULT_ACCOUNT = "main"
+DEFAULT_PROFILE = os.path.join(os.path.expanduser("~"), ".config", "claude-bridge-chrome")
+PORT = int(os.environ.get("CLAUDE_BRIDGE_PORT", str(DEFAULT_PORT)))
 BASE = f"http://{HOST}:{PORT}"
 DEFAULT_TIMEOUT = float(os.environ.get("CLAUDE_BRIDGE_TIMEOUT", "600"))
 LAUNCHER = os.path.join(HERE, "start-bridge-chrome.sh")
 UP_SCRIPT = os.path.join(HERE, "bridge-up.sh")
 CONFIG_PATH = os.path.join(HERE, "config.json")
+# The pinned tab, and the profile/port/chat/base, are per *account*: they are set here and
+# then decided by use_account() from config.json (see "accounts" below).
+ACCOUNT = DEFAULT_ACCOUNT
+PROFILE = DEFAULT_PROFILE
 TARGET_PATH = os.path.join(HERE, "bridge-target.json")
+LEGACY_TARGET_PATH = TARGET_PATH          # the single pin a pre-accounts bridge wrote
 
 # The web UI has no /compact (its slash menu only lists skills), so "compact" is
 # the documented equivalent: ask Claude for a short handoff a fresh chat can pick up.
@@ -251,29 +259,171 @@ def save_config(cfg: dict) -> None:
     os.replace(tmp, CONFIG_PATH)
 
 
-def load_target() -> str:
-    """The CDP id of the tab the bridge drives (so extra tabs cannot confuse it)."""
+# ---------------------------------------------------------------- accounts
+# One claude.ai account per Chrome profile.  Chrome 136+ refuses the DevTools port on the
+# default profile, which is why the bridge window always used a profile of its own; an
+# account is that same idea once there is more than one.  The sign-in is kept in the
+# profile, so each account is signed in once, ever, and a switch costs one command.
+#
+#   "active_account": "main",
+#   "accounts": {
+#     "main":  {"profile": "~/.config/claude-bridge-chrome",       "port": 9222, "chat_url": "..."},
+#     "spare": {"profile": "~/.config/claude-bridge-chrome-spare", "port": 9223, "chat_url": ""}
+#   }
+#
+# A config with no `accounts` block reads as one account named `main`, built from the older
+# top-level `chat_url` - so an install that predates this keeps working untouched, and the
+# old bridge-target.json stays the pin until that account pins a tab again.
+
+def account_names(cfg: dict | None = None) -> list[str]:
+    """Every configured account, in config order.  Never empty."""
+    cfg = load_config() if cfg is None else cfg
+    names = [n for n, s in (cfg.get("accounts") or {}).items() if isinstance(s, dict)]
+    return names or [DEFAULT_ACCOUNT]
+
+
+def active_account(cfg: dict | None = None) -> str:
+    cfg = load_config() if cfg is None else cfg
+    name = str(cfg.get("active_account") or "").strip()
+    return name if name in account_names(cfg) else account_names(cfg)[0]
+
+
+def account_spec(name: str | None = None, cfg: dict | None = None) -> dict:
+    """One account's profile, port and chat, with the defaults filled in.
+
+    Never fails: an unknown name still resolves, so ``--switch-account spare`` can bring a
+    new account up and write it down, and a config with no accounts block resolves to
+    `main` from the legacy keys.
+    """
+    cfg = load_config() if cfg is None else cfg
+    names = account_names(cfg)
+    name = name or active_account(cfg)
+    if name not in names:
+        names = names + [name]
+    raw = dict(((cfg.get("accounts") or {}).get(name) or {}))
+    profile = str(raw.get("profile") or (
+        DEFAULT_PROFILE if name == DEFAULT_ACCOUNT else "%s-%s" % (DEFAULT_PROFILE, name)))
+    chat = str(raw.get("chat_url") or "")
+    if not chat and name == DEFAULT_ACCOUNT:
+        chat = str(cfg.get("chat_url") or "")       # the pre-accounts config
+    port = raw.get("port") or (DEFAULT_PORT + names.index(name))
+    return {"name": name, "profile": os.path.expanduser(profile), "port": int(port),
+            "chat_url": chat}
+
+
+def target_path_for(name: str) -> str:
+    """One pinned-tab file per account: a pin on the spare is not a pin on main."""
+    return os.path.join(HERE, "bridge-target-%s.json" % name)
+
+
+def port_alive(port: int) -> bool:
+    """Is a bridge Chrome listening on this port?  Asked without touching any page."""
     try:
-        with open(TARGET_PATH) as f:
+        with urllib.request.urlopen("http://%s:%d/json/version" % (HOST, port), timeout=1.5) as r:
+            return bool(r.read())
+    except Exception:
+        return False
+
+
+def use_account(name: str | None = None, cfg: dict | None = None) -> dict:
+    """Point this process at one account and return its spec.
+
+    Port, base url, Chrome profile, pinned-tab file and the chat to drive are module
+    globals, so this is the single place a switch happens: ``--account`` for one call,
+    ``--switch-account`` for good.  The environment still wins over config.json, so a
+    one-off (``CLAUDE_BRIDGE_PORT=9333 ask-claude --status``) can override the lot.
+    """
+    global ACCOUNT, PROFILE, PORT, BASE, TARGET_PATH, DEFAULT_URL
+    spec = account_spec(name, cfg)
+    ACCOUNT = spec["name"]
+    PROFILE = os.environ.get("CLAUDE_BRIDGE_PROFILE") or spec["profile"]
+    PORT = int(os.environ.get("CLAUDE_BRIDGE_PORT") or spec["port"])
+    BASE = "http://%s:%d" % (HOST, PORT)
+    TARGET_PATH = target_path_for(ACCOUNT)
+    DEFAULT_URL = target_url(cfg, spec)
+    return spec
+
+
+def set_chat_url(url: str, cfg: dict | None = None) -> str:
+    """Remember `url` as the chat of the *active* account, and return that account's name.
+
+    The legacy top-level `chat_url` is kept naming the same chat: it is what anything
+    predating accounts reads, and a switch must not leave it pointing at the old account.
+    """
+    cfg = load_config() if cfg is None else cfg
+    name = active_account(cfg)
+    spec = account_spec(name, cfg)
+    acc = cfg.setdefault("accounts", {}).setdefault(name, {})
+    acc.setdefault("profile", spec["profile"])
+    acc.setdefault("port", spec["port"])
+    acc["chat_url"] = url
+    cfg["active_account"] = name
+    cfg["chat_url"] = url
+    save_config(cfg)
+    return name
+
+
+def remember_account(name: str, cfg: dict | None = None) -> dict:
+    """Write one account's block down (profile, port, chat) without making it active.
+
+    This is also the migration: the first time it runs for `main`, the account the bridge
+    has been using all along - legacy `chat_url` and all - gets written down as a block.
+    """
+    cfg = load_config() if cfg is None else cfg
+    spec = account_spec(name, cfg)
+    acc = cfg.setdefault("accounts", {}).setdefault(spec["name"], {})
+    acc["profile"] = spec["profile"]
+    acc["port"] = spec["port"]
+    acc["chat_url"] = spec["chat_url"]
+    save_config(cfg)
+    return spec
+
+
+def set_active_account(name: str, cfg: dict | None = None) -> dict:
+    """Write `name` down as the account the bridge drives, creating it if it is new."""
+    spec = remember_account(name, cfg)
+    cfg = load_config()
+    cfg["active_account"] = spec["name"]
+    cfg["chat_url"] = spec["chat_url"] or ""
+    save_config(cfg)
+    return spec
+
+
+def load_target(name: str | None = None) -> str:
+    """The CDP id of the tab the bridge drives (so extra tabs cannot confuse it)."""
+    path = TARGET_PATH if name is None else target_path_for(name)
+    if (not os.path.exists(path) and path == target_path_for(DEFAULT_ACCOUNT)
+            and os.path.exists(LEGACY_TARGET_PATH)):
+        path = LEGACY_TARGET_PATH          # the pin written before accounts existed
+    try:
+        with open(path) as f:
             return json.load(f).get("target") or ""
     except Exception:
         return ""
 
 
-def save_target(target_id: str) -> None:
+def save_target(target_id: str, name: str | None = None) -> None:
     try:
-        tmp = TARGET_PATH + ".tmp"
+        path = TARGET_PATH if name is None else target_path_for(name)
+        tmp = path + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"target": target_id, "saved": time.time()}, f, indent=2)
-        os.replace(tmp, TARGET_PATH)
+            json.dump({"target": target_id, "saved": time.time(), "account": ACCOUNT}, f, indent=2)
+        os.replace(tmp, path)
     except Exception:
         pass  # remembering the tab is an optimisation, never a failure
 
 
-def target_url() -> str:
+def target_url(cfg: dict | None = None, spec: dict | None = None) -> str:
+    """The chat to drive: the one belonging to the account this process is *on*.
+
+    Deliberately not "the active account in config.json": `--account NAME` moves one call
+    onto another account without writing anything down, and a let-out like that must not
+    send the call to the other account's chat.
+    """
+    spec = spec or account_spec(ACCOUNT, cfg)
     return (
         os.environ.get("CLAUDE_BRIDGE_URL")
-        or load_config().get("chat_url")
+        or spec.get("chat_url")
         or NEW_CHAT_URL
     )
 
@@ -291,6 +441,13 @@ def is_new_chat_url(url: str) -> bool:
 
 
 DEFAULT_URL = target_url()
+
+# Resolve the account once, at import: the watcher runs for hours and reads config.json
+# once, which is why --switch-account restarts it rather than expecting it to notice.
+try:
+    use_account()
+except Exception:  # a broken config must not stop the bridge from starting
+    pass
 
 try:
     from websockets.sync.client import connect as ws_connect
@@ -322,7 +479,7 @@ def browser_ws() -> str | None:
 
 
 def ensure_chrome(url: str | None = None) -> bool:
-    """Make sure the bridge Chrome is up. Returns True if reachable."""
+    """Make sure the bridge Chrome for the active account is up. True if reachable."""
     if cdp_alive():
         return True
     if not os.path.exists(LAUNCHER):
@@ -330,6 +487,8 @@ def ensure_chrome(url: str | None = None) -> bool:
     try:
         subprocess.Popen(
             ["bash", LAUNCHER, url or DEFAULT_URL],
+            env=dict(os.environ, CLAUDE_BRIDGE_PROFILE=PROFILE,
+                     CLAUDE_BRIDGE_PORT=str(PORT)),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -383,6 +542,159 @@ def start_bridge() -> dict:
         except Exception:
             out["watcher"] = False
     return out
+
+
+def restart_watcher() -> str:
+    """Restart the loop so it reads the new account (it reads config.json once, at startup).
+
+    Through ``watcher.sh restart``, which knows that a supervisor has to do the replacing:
+    a plain stop+start would make systemd see its unit's process vanish and start a second.
+    """
+    script = os.path.join(HERE, "watcher.sh")
+    if not os.path.exists(script):
+        return "no watcher.sh found - start the watcher yourself"
+    try:
+        p = subprocess.run(["bash", script, "restart"], capture_output=True, text=True,
+                           timeout=180)
+    except Exception as e:
+        return "not restarted (%s)" % e
+    text = (p.stdout or p.stderr or "").strip()
+    if p.returncode != 0:
+        return "not restarted (%s)" % (text[-200:] or p.returncode)
+    return text.splitlines()[-1] if text else "restarted"
+
+
+def accounts_report() -> list[dict]:
+    """Every account, with what choosing one needs: where it lives and whether it is up."""
+    cfg = load_config()
+    active = active_account(cfg)
+    return [dict(account_spec(name, cfg), active=(name == active),
+                 window=port_alive(account_spec(name, cfg)["port"]))
+            for name in account_names(cfg)]
+
+
+def print_accounts(json_out: bool = False) -> int:
+    rows = accounts_report()
+    active = next((r["name"] for r in rows if r["active"]), DEFAULT_ACCOUNT)
+    if json_out:
+        print(json.dumps({"active": active, "accounts": rows}, indent=1))
+        return 0
+    print("accounts (active: %s)" % active)
+    for r in rows:
+        print("  %s %-8s :%-5d %-11s %s" % ("*" if r["active"] else " ", r["name"], r["port"],
+                                           "window up" if r["window"] else "window down",
+                                           r["profile"]))
+        print("    chat: %s" % (r["chat_url"] or "(none yet - a fresh chat opens on switch)"))
+    print("switch with: ask-claude --switch-account <name>")
+    return 0
+
+
+def switch_account(name: str, seed: str = "", timeout: float = DEFAULT_TIMEOUT) -> dict:
+    """Move the bridge to another account, in the order that cannot lose a report.
+
+    1. deliver what the outbox holds **through the account we are leaving**: those reports
+       are answers to that chat, and after the move it is no longer the chat we drive;
+    2. bring the other account's window up (its own profile and port) and look at the
+       sign-in.  A profile is signed in once, ever - so the first switch to a fresh account
+       ends here, with the window open and nothing written;
+    3. only then write it into config.json, so a switch that cannot finish leaves the loop
+       exactly where it was;
+    4. restart the watcher, which reads config.json once, at startup.
+
+    A report produced *during* the switch is an ordinary outbox entry - not one of the files
+    this call flushes - so it goes out exactly once, by the next pass or the next flush.
+    """
+    cfg = load_config()
+    was = active_account(cfg)
+    out: dict = {"from": was, "to": name, "switched": False, "sent": [], "remaining": [],
+                 "signed_in": None, "chat": None, "target": "", "seeded": False,
+                 "watcher": "", "detail": ""}
+
+    # 1. the outbox first, while the old chat is still the one we drive
+    try:
+        res = Bridge().flush_outbox(timeout=min(120.0, timeout))
+        out["sent"] = res.get("sent") or []
+        out["remaining"] = res.get("remaining") or []
+        if res.get("stopped"):
+            out["detail"] += "outbox held back: %s; " % res["stopped"]
+    except Exception as e:
+        out["detail"] += "outbox not flushed (%s); " % e
+
+    # 2. the other account's window
+    spec = account_spec(name, cfg)
+    use_account(name, cfg)
+    out["profile"], out["port"] = PROFILE, PORT
+    if not ensure_chrome(DEFAULT_URL):
+        out["detail"] += "the %s window did not come up on :%d" % (name, PORT)
+        use_account(was, cfg)
+        return out
+    b = Bridge()
+    c = b.connect(want_composer=False)
+    try:
+        st = b.state(c)
+        signed = bool(st.get("composer"))
+        url = (st.get("url") or "").split("#")[0]
+        out["signed_in"], out["chat"] = signed, url
+        if not signed:
+            out["detail"] += ("the window is up but not signed in - sign in to claude.ai in "
+                              "it once, then run this again")
+            use_account(was, cfg)
+            return out
+        if seed and not spec.get("chat_url"):
+            # A seed is the first message of an account that has no chat yet (Phase B's
+            # pack will feed this) - never into a thread that is already running.
+            out["reply"] = b._ask_with(c, seed, timeout)
+            st = b.state(c)
+            url = (st.get("url") or "").split("#")[0]
+            out["chat"], out["seeded"] = url, True
+        out["target"] = st.get("target") or ""
+    finally:
+        c.close()
+
+    # 3. it is written down now, and the chat and the pinned tab with it
+    remember_account(was)          # the account we leave keeps its own chat and profile
+    set_active_account(name)
+    set_chat_url(out["chat"] or NEW_CHAT_URL)
+    save_target(out["target"])
+    out["switched"] = True
+
+    # 4. and the loop follows
+    out["watcher"] = restart_watcher()
+    return out
+
+
+def print_switch(res: dict, json_out: bool = False) -> int:
+    if json_out:
+        print(json.dumps(res, indent=1))
+        return 0 if res["switched"] else 3
+    if res["switched"] and res["from"] == res["to"]:
+        print("already on account %s" % res["to"])
+    elif res["switched"]:
+        print("switched: %s -> %s" % (res["from"], res["to"]))
+    else:
+        print("not switched - still on %s" % res["from"])
+    print("  account   : %s on :%d" % (res["to"], res.get("port") or 0))
+    if res.get("profile"):
+        print("  profile   : %s" % res["profile"])
+    print("  signed in : %s" % res["signed_in"])
+    if res.get("chat"):
+        print("  chat      : %s" % res["chat"])
+    if res.get("seeded"):
+        print("  seeded    : the chat was opened with your first message")
+    if res.get("target"):
+        print("  pinned tab: %s" % res["target"])
+    if res["sent"] or res["remaining"]:
+        print("  outbox    : %d delivered, %d still queued"
+              % (len(res["sent"]), len(res["remaining"])))
+        for f in res["remaining"]:
+            print("              still queued: %s" % os.path.basename(f))
+    if res.get("watcher"):
+        print("  watcher   : %s" % res["watcher"])
+    if res.get("detail"):
+        print("  note      : %s" % res["detail"].rstrip("; "))
+    if not res["switched"]:
+        print("  nothing was changed; the loop is still talking to %s" % res["from"])
+    return 0 if res["switched"] else 3
 
 
 def find_page(url_sub: str = "claude.ai"):
@@ -1447,6 +1759,15 @@ def main(argv=None):
     ap.add_argument("--download", metavar="MATCH", nargs="?", const="", default=None,
                     help="download Claude's file card(s); optional MATCH on the title")
     ap.add_argument("--save-chat", action="store_true", help="remember the claude.ai chat currently open in the bridge window")
+    ap.add_argument("--switch-account", metavar="NAME", nargs="?", const="", default=None,
+                    help="move the bridge to another claude.ai account (its own Chrome profile, "
+                         "signed in once - or, on the first switch, sign in now); with no NAME, "
+                         "list the accounts. Add a message to seed an account with no chat yet")
+    ap.add_argument("--account", metavar="NAME", default=None,
+                    help="use NAME's account for this call only (profile, port, chat, pinned tab)")
+    ap.add_argument("--account-env", action="store_true",
+                    help="print the active account as PROFILE<TAB>PORT<TAB>CHAT<TAB>NAME, "
+                         "for shell scripts")
     ap.add_argument("--image", metavar="PATH", action="append", default=None,
                     help="attach an image to the message (repeatable; a directory means its "
                          "images, newest first)")
@@ -1471,6 +1792,21 @@ def main(argv=None):
         except ValueError as e:
             ap.error(str(e))
 
+    # Which claude.ai account this call drives decides the port, the profile, the pinned tab
+    # and the chat - so it is resolved before anything connects.
+    if args.account:
+        use_account(args.account)
+    if args.account_env:
+        spec = account_spec(args.account) if args.account else use_account()
+        print("\t".join([PROFILE, str(PORT), spec["chat_url"] or "", spec["name"]]))
+        return 0
+    if args.switch_account is not None:
+        if not args.switch_account:
+            return print_accounts(args.json)
+        return print_switch(switch_account(args.switch_account,
+                                           seed=" ".join(args.message).strip(),
+                                           timeout=args.timeout), args.json)
+
     b = Bridge(args.url or args.goto)
     try:
         if args.open:
@@ -1484,6 +1820,7 @@ def main(argv=None):
                 print(json.dumps(res, indent=1))
             else:
                 print(f"bridge window : {'up' if res['window'] else 'DOWN'}")
+                print(f"account       : {ACCOUNT} on :{PORT}")
                 print(f"signed in     : {res['signed_in']}")
                 print(f"chat          : {res['chat']}")
                 print(f"watcher       : {'running' if res['watcher'] else 'NOT running'}")
@@ -1581,13 +1918,14 @@ def main(argv=None):
                 url = (st.get("url") or "").split("#")[0]
                 if "claude.ai" not in url:
                     raise RuntimeError(f"the bridge page is not a claude.ai chat: {url}")
-                cfg = load_config()
-                cfg["chat_url"] = url
-                save_config(cfg)
+                set_chat_url(url)
                 if args.json:
-                    print(json.dumps({"new_chat": url, "seeded": bool(text), "reply": reply}))
+                    print(json.dumps({"new_chat": url, "seeded": bool(text), "reply": reply,
+                                      "account": ACCOUNT}))
                 else:
                     print(f"new chat: {url}")
+                    print(f"  remembered for account {ACCOUNT} (its own chat; switching back "
+                          f"to {ACCOUNT} comes back here)")
                     if text:
                         print("--- Claude opened the thread with ---")
                         print(reply or "")
@@ -1600,19 +1938,21 @@ def main(argv=None):
                 url = (st.get("url") or "").split("#")[0]
                 if "claude.ai" not in url:
                     raise RuntimeError(f"the bridge page is not a claude.ai chat: {url}")
-                cfg = load_config()
-                cfg["chat_url"] = url
-                save_config(cfg)
-                out = {"saved": url, "config": CONFIG_PATH}
+                set_chat_url(url)
+                out = {"saved": url, "config": CONFIG_PATH, "account": ACCOUNT}
                 if args.json:
                     print(json.dumps(out))
                 else:
-                    print(f"remembered chat: {url}")
+                    print(f"remembered chat for account {ACCOUNT}: {url}")
                 return 0
             if args.probe:
                 out = b.probe(c)
             elif args.status:
                 out = b.state(c)
+                out["account"] = ACCOUNT
+                out["profile"] = PROFILE
+                out["port"] = PORT
+                out["accounts"] = accounts_report()
                 out["target"] = load_target()
                 out["tabs"] = [t.get("url") for t in b._pages()]
             elif args.read:

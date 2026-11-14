@@ -2,15 +2,36 @@
 # Start (or reuse) the dedicated "Claude bridge" Chrome window.
 #
 #   bash start-bridge-chrome.sh [url]
+#   CLAUDE_BRIDGE_ACCOUNT=spare bash start-bridge-chrome.sh [url]
 #
 # The window uses its own profile so the DevTools port is allowed (Chrome 136+
 # refuses it on the default profile). Sign in to claude.ai in this window once;
-# the sign-in is kept in the profile from then on.
+# the sign-in is kept in the profile from then on.  One profile = one account, so an
+# account is signed in once, ever.
+#
+# With CLAUDE_BRIDGE_ACCOUNT set, that account's profile, port and chat are read from
+# config.json (`ask-claude --switch-account` is the normal way to do this).
+# An explicit CLAUDE_BRIDGE_PROFILE / CLAUDE_BRIDGE_PORT / url argument still wins.
 set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
 
 PORT="${CLAUDE_BRIDGE_PORT:-9222}"
 PROFILE="${CLAUDE_BRIDGE_PROFILE:-$HOME/.config/claude-bridge-chrome}"
 URL="${1:-${CLAUDE_BRIDGE_URL:-https://claude.ai/new}}"
+
+if [ -n "${CLAUDE_BRIDGE_ACCOUNT:-}" ]; then
+  spec="$(python3 "$HERE/bridge.py" --account-env --account "$CLAUDE_BRIDGE_ACCOUNT" \
+          2>/dev/null || true)"
+  if [ -n "$spec" ]; then
+    IFS=$'\t' read -r a_profile a_port a_chat a_name <<<"$spec"
+    PROFILE="${CLAUDE_BRIDGE_PROFILE:-$a_profile}"
+    PORT="${CLAUDE_BRIDGE_PORT:-$a_port}"
+    URL="${1:-${CLAUDE_BRIDGE_URL:-${a_chat:-https://claude.ai/new}}}"
+    echo "account: $a_name"
+  else
+    echo "no account '$CLAUDE_BRIDGE_ACCOUNT' in config.json - using the defaults" >&2
+  fi
+fi
 
 CHROME="${CHROME_BIN:-}"
 if [ -z "$CHROME" ]; then
