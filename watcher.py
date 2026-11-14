@@ -403,6 +403,12 @@ def resolve_order_files(order: dict, files: list[dict],
     return attached, missing
 
 
+# A report older than this is not evidence that an agent is working the order *now*: it
+# is a leftover from an earlier round that happened to carry the same id.  A self-dispatch
+# is by definition recent - an agent read the order out of the planner's chat moments ago.
+SELF_DONE_MAX_AGE = 24 * 3600
+
+
 def route_orders(st: dict, orders: list[dict]) -> dict:
     """Split extracted orders into what the watcher should do with each.
 
@@ -410,11 +416,15 @@ def route_orders(st: dict, orders: list[dict]) -> dict:
     * incomplete - told us to do something, but not where or how it is done
     * duplicate  - an id that already ran, re-posted with different text
     * ignored    - byte-identical re-post of something already handled
+    * reported   - never started here, but its report file is already on disk: its own
+                   agent took the order out of the planner's chat and worked it
     """
-    out: dict[str, list] = {"dispatch": [], "incomplete": [], "duplicate": [], "ignored": []}
+    out: dict[str, list] = {"dispatch": [], "incomplete": [], "duplicate": [],
+                            "ignored": [], "reported": []}
     seen = st.get("orders") or {}
     sessions = st.get("sessions") or {}
     starts = st.get("starts") or {}
+    self_done = st.get("self_reported") or {}
     if isinstance(seen, list):                     # tolerate an older state file
         seen = {k: "" for k in seen}
     for o in orders:
@@ -428,7 +438,50 @@ def route_orders(st: dict, orders: list[dict]) -> dict:
         rec = starts.get(o["id"]) or {}
         ran = bool(sessions.get(o["id"]) or rec.get("session")
                    or rec.get("status") in ("started", "dry_run"))
+        if not ran:
+            try:
+                mtime = os.path.getmtime(report_file(o["id"]))
+            except OSError:
+                mtime = None
+            # `self_done` holds the report already accounted for, so a re-post of the same
+            # id with *different* text (a genuine new round) still reaches `dispatch`.
+            if (mtime is not None and mtime != self_done.get(o["id"])
+                    and time.time() - mtime < SELF_DONE_MAX_AGE):
+                out["reported"].append(o)
+                continue
         out["duplicate" if ran else "dispatch"].append(o)
+    return out
+
+
+def close_self_reported_orders(st: dict, orders: list[dict],
+                               dry_run: bool = False) -> list[str]:
+    """Close the orders an agent took from the planner's chat and did on its own.
+
+    When an agent reads the bridge chat itself it can pick an order up before the loop
+    dispatches it (it is held over ``max_agents``, or the loop is on a later pass), leave
+    ``reports/<id>.md`` and move on.  Dispatching it then does the work twice and posts the
+    same report a second time, so the order is closed here instead.
+
+    The report is **not** queued for the planner: an agent that took an order from that
+    chat relays its own report - it is on that chat to hear the order at all - and the file
+    stays on disk for the person either way.  See :func:`queue_report` for the one-sided
+    case this deliberately does not repeat.
+    """
+    out: list[str] = []
+    for o in orders:
+        oid = o["id"]
+        rp = report_file(oid)
+        if dry_run:
+            log("  %s was already done by its own agent - %s exists (dry run: nothing changed)"
+                % (oid, os.path.basename(rp)))
+            out.append(oid)
+            continue
+        log("%s was already done by its own agent - it left %s and was never started here, "
+            "so it is not dispatched again" % (oid, os.path.basename(rp)))
+        st.setdefault("orders", {})[oid] = _hash(o["raw"])
+        st.setdefault("self_reported", {})[oid] = os.path.getmtime(rp)
+        finish_order(st, oid)
+        out.append(oid)
     return out
 
 
@@ -1023,7 +1076,7 @@ def dispatch_batch(cfg: dict, st: dict, orders: list[dict], dry_run: bool = Fals
 def attention_needed(routed: dict, text: str) -> bool:
     """Would this message need an ask at all?  Deliberately cheap: no API calls,
     so the watcher only checks whether an agent is busy when it has to."""
-    if routed.get("dispatch") or routed.get("ignored"):
+    if routed.get("dispatch") or routed.get("ignored") or routed.get("reported"):
         return False
     return bool(routed.get("incomplete") or routed.get("duplicate")
                 or looks_like_work_promise(text))
@@ -2111,6 +2164,7 @@ def pass_once(cfg: dict, st: dict, dry_run: bool = False) -> dict:
     for m in msgs:
         orders.extend(extract_work_orders(m))
     routed = route_orders(st, orders)
+    close_self_reported_orders(st, routed.get("reported") or [], dry_run=dry_run)
     new = routed["dispatch"]
     # An order finished a week ago needs nothing but its `finished` mark, and its start
     # record is the bulk of state.json.  Safe to do on every pass: it only ever touches

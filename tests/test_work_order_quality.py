@@ -42,6 +42,14 @@ dir: /tmp
 goal: do the thing
 >>>"""
 
+SELF = """<<<WORK-ORDER
+id: WO-204
+dir: /tmp
+branch: main
+goal: measure the three reference clips
+acceptance: the report lists the numbers for every clip
+>>>"""
+
 REPORT = ("Done: 3 commits, suite green, pushed. The two flaky specs are environmental "
           "and I have left them out of this phase.")
 
@@ -114,6 +122,7 @@ def test_completeness() -> str:
 # --- routing: what the watcher does with each ------------------------------------------
 
 def test_routing() -> str:
+    tmp_env()          # never let this machine's own reports/ decide a proof
     good = bridge.extract_work_orders(COMPLETE)[0]
     # what handle_orders actually stores is the hash of the block body it parsed
     st = {"orders": {good["id"]: watcher._hash(good["raw"])}, "sessions": {}, "starts": {}}
@@ -135,6 +144,42 @@ def test_routing() -> str:
     assert [o["id"] for o in routed["duplicate"]] == ["WO-201"], routed
     assert not routed["dispatch"], routed
     return "complete->dispatch, half->incomplete, re-post after a run->duplicate, same text->ignored"
+
+
+def test_self_done_order_is_closed_not_dispatched() -> str:
+    """An agent that takes an order out of the planner's chat leaves the report before this
+    loop ever starts it: closing it beats dispatching it again, and a stale report from an
+    older round must not be mistaken for one."""
+    tmp_env()
+    os.makedirs(watcher.REPORTS, exist_ok=True)
+    report = os.path.join(watcher.REPORTS, "WO-204.md")
+    with open(report, "w") as fh:
+        fh.write("DONE - the agent read this order out of the chat and worked it.\n")
+
+    st: dict = {}
+    routed = watcher.route_orders(st, bridge.extract_work_orders(SELF))
+    assert [o["id"] for o in routed["reported"]] == ["WO-204"], routed
+    assert not routed["dispatch"], routed
+    assert not watcher.attention_needed({"reported": routed["reported"]}, PROSE_PROMISE)
+
+    closed = watcher.close_self_reported_orders(st, routed["reported"])
+    assert closed == ["WO-204"], closed
+    assert "WO-204" in (st.get("finished") or {}), st
+    assert st["orders"]["WO-204"] == watcher._hash(
+        bridge.extract_work_orders(SELF)[0]["raw"]), st
+
+    # closed once, the same text is an ignored re-post - never a dispatch
+    again = watcher.route_orders(st, bridge.extract_work_orders(SELF))
+    assert [o["id"] for o in again["ignored"]] == ["WO-204"], again
+    assert not again["dispatch"], again
+
+    # a report from an older round is not evidence of a self-dispatch
+    old = time.time() - watcher.SELF_DONE_MAX_AGE - 60
+    os.utime(report, (old, old))
+    stale = watcher.route_orders({}, bridge.extract_work_orders(SELF))
+    assert [o["id"] for o in stale["dispatch"]] == ["WO-204"], stale
+    assert not stale["reported"], stale
+    return "a self-done order is closed, never dispatched twice, and a stale report is not evidence"
 
 
 def test_incomplete_never_starts_an_agent() -> str:
@@ -306,6 +351,7 @@ def main() -> int:
         ("prose is not an order", test_prose_is_not_an_order),
         ("an order must be complete", test_completeness),
         ("routing", test_routing),
+        ("a self-done order is closed, not dispatched", test_self_done_order_is_closed_not_dispatched),
         ("half an order never starts an agent", test_incomplete_never_starts_an_agent),
         ("dispatch clears the stall flag", test_dispatch_clears_the_stall_flag),
         ("promise detection", test_promise_detection),
