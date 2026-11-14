@@ -16,12 +16,21 @@ out of memory**, which outranks **noise**.
   is done — correctly, that is what frees the slot — but the **planner** is still waiting, and the
   planner is what decides what happens next: the queue stops there. WO-158 was posted anyway,
   so this one cost a stalled order, not the whole loop.
-- **Close with.** The bridge records every report it actually puts in the chat
-  (`delivered/<order>.json`), the watcher checks that record when it finishes an order from the
-  report file, and re-delivers the file itself (marked *"from the report file"*) when there is no
-  record. A lost report then costs one pass instead of a stalled loop.
-- **Proof.** Offline: auto-finish with no record → exactly one delivery, marked; with a record →
-  no second report; an agent that both sent a report and left the file → never sent twice.
+- **Done** (`7b8bfeb`), by the signal the loop already had rather than a new ledger. An agent
+  that sends a report calls `ask_claude`, and the watcher can see that call in the agent's own
+  transcript — the same read that already finishes an order. So: a finish **from the report file
+  alone** (no report in the transcript) queues that file for the planner through the outbox the
+  watcher already flushes, marked *"[WO-x wrote this to reports/WO-x.md and its own report never
+  reached you, so the watcher is sending it]"*. No new file format, no order id to invent, and a
+  report the agent did send is never sent twice.
+- **Why not a `delivered/<order>.json` ledger.** The bridge would have to know *which order* a
+  message belongs to, and reports carry no order id (the AGENTS.md template has `project:`, not
+  the id). Attributing by text hash fails the moment the file and the message differ by a word,
+  which is the normal case. The transcript already pairs the two.
+- **Proof.** `test_a_report_file_never_sent_is_queued_for_the_planner`: a sent report is not
+  re-sent; an unsent one is queued exactly once, with the note, and the queue content is checked
+  through `bridge.read_queued` (the same reader the flush uses). The real `outbox/` is redirected
+  in the suite so a test can never deliver anything.
 
 ### 2. Publish the ask fix that is sitting uncommitted (WO-149)
 
@@ -30,19 +39,27 @@ out of memory**, which outranks **noise**.
   window kept its transcript moving (a person was typing in it), so every pass answered "WO-130 is
   still working", the ask about an order block with no `acceptance` line (WO-149) was held
   forever, and a complete order stood still with both slots free.
-- **Status.** Green with it in the tree: **84/84**. Not written in this session — confirm whose
-  it is before publishing.
-- **Close with.** Commit + push, or a revert if the author wants it differently.
+- **Status.** Published in `7b8bfeb` at the person's instruction, with the provenance stated in
+  the commit message. Green with it in the tree: **84/84** (86/86 after the two fixes above).
 
 ### 3. Nothing brings the loop back after a reboot
 
 - **Evidence.** The machine rebooted 11-13 ~16:28 (the log ends 16:27 with the background service
   failing to start). The watcher has been down for 18 h since, no work order has been picked up,
   and there is no systemd user unit and no autostart entry for it.
-- **Close with.** `contrib/claude-bridge-watcher.service` (user unit, `Restart=on-failure`),
-  `systemctl --user enable --now`, and a README line. The existing resume logic already re-prompts
-  the turns a restart interrupted. The visible-window promise is untouched: the unit starts the
-  watcher, and the watcher opens a window (or a tab) per order.
+- **Done.** `contrib/claude-bridge-watcher.service` (user unit, `Type=simple`,
+  `Restart=on-failure`, `RestartSec=15`, `After/PartOf=graphical-session.target`,
+  `Environment=DISPLAY=:0` so a restart can still open a window, `KillMode=process` so a watcher
+  restart never kills an agent). Installed with `systemctl --user link` + `enable --now`; live
+  since 11-14 11:05:41 and it picked up WO-158 within 13 seconds, opening the window
+  `WO-158 - wms-web` (tmux session `cb-wms-web-e5557712`).
+- **Also.** `watcher.sh run` (foreground, for the supervisor) and a supervisor-aware `status` /
+  `stop`: with systemd owning the process there is no pid file, so `running()` alone answered
+  "not running" while the loop was plainly working. `watcher.lock` being held now counts as
+  running, `stop` points at `systemctl --user stop claude-bridge-watcher`, and a second
+  `watcher.sh start` still refuses.
+- **Note.** `Environment=DISPLAY=:0` fits this machine; a session on another display needs that
+  line changed (`echo $DISPLAY`).
 
 ### 4. Two stale "waiting for you" marks outlive their orders
 
@@ -50,8 +67,9 @@ out of memory**, which outranks **noise**.
   both still in `waiting`: a later pass re-adds the mark that the finish removed. The status row
   hides it (finished wins), but reaping treats them as parked and never closes their view, and a
   parked order is never asked about.
-- **Close with.** `note_waiting` skips finished orders, and drops a mark that is already there.
-  Proof in the restart suite.
+- **Done** (`7b8bfeb`). `note_waiting` skips finished orders and drops a mark that is already
+  there. Proof `test_a_finished_order_drops_its_waiting_mark`: a finished order's mark goes and
+  stays gone, and a live parked order still parks.
 
 ---
 

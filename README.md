@@ -233,6 +233,23 @@ Two signals settle it without asking anybody:
 Either one marks the order finished: its slot is free at once, it is never resumed, and
 `watcher.sh status` shows it as finished.
 
+A slot being free is not the same as the planner having read the report. On 2026-11-13
+`reports/WO-157.md` was written at 12:57, its order finished from the file at 13:03, and the
+planner was still saying *"I haven't seen its report"* — an empty outbox, so nothing had even
+tried. So a finish **from the report file alone** (no report in the agent's transcript, which
+is where a report sent with `ask_claude` leaves a trace) queues that file for the planner
+through the outbox this bridge already flushes, with a line saying where it came from:
+
+```
+DONE
+- project: wms-api ...
+[WO-157 wrote this to WO-157.md and its own report never reached you, so the watcher is
+sending it.  Treat it as that order's report.]
+```
+
+A report the agent *did* send is never sent twice, and a finished order is never queued
+again — the finish happens once.
+
 ---
 
 ## Claude hands work back: the work-order queue
@@ -589,6 +606,28 @@ is a user unit for it (`systemctl --user enable --now opencode`); set `max_agent
 `service_start_cooldown` with that in mind. The watcher's own supervision is the default
 because it needs no sudo, and because one starter is what stops the stampede.
 
+### The loop comes back by itself
+
+A reboot used to stop the watcher for good: the machine came up on 2026-11-13 at 16:28 and
+nothing looked at the queue for 18 hours. `contrib/claude-bridge-watcher.service` fixes that -
+the machine restarts the loop:
+
+```bash
+systemctl --user link ~/claude-bridge/contrib/claude-bridge-watcher.service
+systemctl --user enable --now claude-bridge-watcher   # and it starts at every login
+systemctl --user status claude-bridge-watcher
+```
+
+`Restart=on-failure` with a 15 s delay brings it back if it ever dies, `KillMode=process`
+means a watcher restart never touches the agents it started, and `DISPLAY` is set in the unit
+because opening a terminal window needs it (change that one line if your session is on
+another display). `sudo loginctl enable-linger $USER` makes it start before you log in.
+
+With the unit running there is no `watcher.pid` to read, so `watcher.sh status` treats a held
+`watcher.lock` as a running watcher and says a supervisor owns it; `watcher.sh stop` says the
+same and points at `systemctl --user stop claude-bridge-watcher`. Running both is safe but
+pointless: the watcher takes the lock itself, so whichever starts second refuses.
+
 ---
 
 ## Starting a new chat
@@ -680,7 +719,9 @@ How the bridge handles it:
 | `page-shot` | screenshot a running app with its own Playwright — whole page, phone width by default |
 | `mcp_server.py` | MCP (stdio) server exposing `ask_claude` / `page_shot` / `claude_availability` / `wait_for_claude` / `claude_status` / `compact_conversation` / `bridge_up` / `check_work` / `fetch_claude_files` |
 | `watcher.py` | polls the chat for work orders and starts agents on them |
-| `watcher.sh` | start / stop / status the watcher |
+| `watcher.sh` | start / stop / status the watcher (`run` = foreground, for the unit below) |
+| `contrib/claude-bridge-watcher.service` | the systemd user unit that brings the watcher back after a reboot (and on failure) |
+| `contrib/opencode.service` | optional systemd user unit for the opencode background server (the watcher supervises it by default) |
 | `agent-watch.py` | follow a running work-order agent live from any terminal |
 | `terminals/` | the tiny generated launcher scripts each agent's view runs (`<session>.sh` the agent itself, `tab-<session>.sh` the per-repository window) |
 | `start-bridge-chrome.sh` | launches/reuses the dedicated bridge Chrome window |
@@ -692,6 +733,7 @@ How the bridge handles it:
 | `drafts/` | the text of a draft `--clear` had to empty out of the composer (never sent, never lost) |
 | `shots/` | screenshots taken by `page-shot` when no path was given |
 | `reports/` | the DONE report each finished agent leaves (`<id>.md`) — its appearing frees that order's slot |
+| `outbox/` | reports that could not be delivered (a bridge window that was down, or a report file the planner never saw) — the watcher flushes these on its next pass |
 | `state.json` | which orders and files have been handled (watcher) |
 | `watcher.log` | what the watcher has done |
 | `terminal.log` | output of the agent windows the watcher opened |

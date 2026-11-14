@@ -1,0 +1,49 @@
+# The loop has to come back by itself after a reboot.
+#
+# Without this, a reboot stops the watcher and nothing starts it again: on 2026-11-13 the
+# machine came back up at 16:28 and the loop stayed down for 18 hours, with an order
+# sitting in the chat that nobody picked up.  The machine is the thing that fails, so the
+# machine is the thing that restarts the loop.
+#
+#   systemctl --user link ~/claude-bridge/contrib/claude-bridge-watcher.service
+#   systemctl --user enable --now claude-bridge-watcher
+#   systemctl --user status claude-bridge-watcher
+#
+# Nothing here is silent: the watcher opens a terminal window (or a tab) per work order, and
+# it only ever starts work that the planner asked for.
+#
+# To have it start without you logging in (needs sudo):
+#   sudo loginctl enable-linger $USER
+#
+# `systemctl --user start claude-bridge-watcher` and `~/claude-bridge/watcher.sh start` are
+# alternatives, not companions: the watcher takes watcher.lock itself, so the second one
+# refuses to start rather than running a duplicate loop.
+
+[Unit]
+Description=claude-bridge watcher (the planner's work orders to visible opencode agents)
+Documentation=file:%h/claude-bridge/README.md
+# it opens terminal windows, so it belongs to the session that has the display
+After=graphical-session.target
+PartOf=graphical-session.target
+# a flap must not spin - the log gets the reason instead
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/claude-bridge
+ExecStart=%h/claude-bridge/watcher.sh run
+# it never touches the agents it started: a watcher restart is not an agent restart
+KillMode=process
+Restart=on-failure
+RestartSec=15
+# the display, so a restart can still open the window for an agent.  Change it if your
+# session is on another display (`echo $DISPLAY`).
+Environment=DISPLAY=:0
+# one file for everything: the watcher writes watcher.log itself, and this catches anything
+# that dies before it can (a Python traceback at import, say)
+StandardOutput=append:%h/claude-bridge/watcher.log
+StandardError=append:%h/claude-bridge/watcher.log
+
+[Install]
+WantedBy=default.target
