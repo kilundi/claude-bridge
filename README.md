@@ -707,10 +707,12 @@ ask-claude --goto "https://claude.ai/chat/<id>" --save-chat
 
 Details worth knowing:
 
-- **The driven tab is remembered** (`bridge-target.json`, git-ignored). Extra
-  claude.ai tabs are left alone and cannot capture your messages; if that tab is
-  closed, the bridge falls back to the tab showing the saved chat.
-- **`--status` shows it**: `url`, the `target` it drives, and the `tabs` it can see.
+- **The driven tab is remembered per account** (`bridge-target-<account>.json`, git-ignored;
+  the single `bridge-target.json` a pre-accounts bridge wrote is still read for `main` until
+  it pins one again). Extra claude.ai tabs are left alone and cannot capture your messages;
+  if the pinned tab is closed, the bridge falls back to the tab showing the saved chat.
+- **`--status` shows it**: `url`, the `account` and its `port`, the `target` it drives, and
+  the `tabs` it can see.
 - **The queue carries over.** `state.json` keeps the orders this machine has
   already handled, so nothing re-dispatches just because the chat changed. An
   order is skipped only when its `id` **and** its text are byte-identical to one
@@ -720,6 +722,70 @@ Details worth knowing:
   compact step runs when the limit lifts; see the section below.
 - **Cheaper than it sounds**: starting the chat costs no Claude message if you
   send nothing.
+
+---
+
+## More than one Claude account
+
+Claude's free plan runs out mid-work, and the account you continue on knows nothing about the
+work. The bridge can hold more than one account and move between them, so a limit costs one
+command instead of a re-briefing.
+
+**An account is a Chrome profile.** Chrome 136+ will not expose the DevTools port on the
+default profile, which is why the bridge window always used a profile of its own; an account
+is that same idea once there is more than one. Each account gets its own profile directory
+and its own port, keeps its own claude.ai chat, and **its own pinned tab** - a pin on the
+spare must never decide which tab the bridge drives on main. The sign-in lives in the
+profile, so each account is signed in once, ever.
+
+```bash
+ask-claude --switch-account                # list the accounts, and which one is active
+ask-claude --switch-account spare          # move the loop onto "spare"
+ask-claude --switch-account spare "context: ..."   # ... seeding a fresh chat with your brief
+ask-claude --account spare --status        # one call on another account, nothing written down
+```
+
+`config.json` grows its accounts the first time they are used (and can be edited by hand):
+
+```json
+"active_account": "main",
+"accounts": {
+  "main":  {"profile": "~/.config/claude-bridge-chrome",       "port": 9222, "chat_url": "https://claude.ai/chat/<id>"},
+  "spare": {"profile": "~/.config/claude-bridge-chrome-spare", "port": 9223, "chat_url": ""}
+}
+```
+
+A config written before any of this existed has no `accounts` block: it reads as one account
+named `main`, built from the older `chat_url`, with the old `bridge-target.json` as its pin.
+Nothing has to be migrated by hand. `CLAUDE_BRIDGE_ACCOUNT=spare bash start-bridge-chrome.sh`
+does the same thing for the launcher, and `CLAUDE_BRIDGE_PROFILE` / `CLAUDE_BRIDGE_PORT`
+still override the account for one command.
+
+**Switching is a move, not a copy**, and it happens in the order that cannot lose a report:
+
+1. the outbox is delivered **through the account being left** - those reports are answers to
+   that chat, and this is the last moment it is the one we drive;
+2. the other account's window comes up (its own profile and port) and the bridge looks at the
+   sign-in. A profile that has never been signed in **ends the switch here**: the window is
+   open, nothing is written down, and the command says so. Sign in to claude.ai in that
+   window once, run it again, and it finishes. An account with no chat yet gets a fresh one -
+   a message after the name is sent as its first turn, and the chat is remembered as that
+   account's, so switching back returns to it;
+3. only then does `config.json` name the new account - a switch that cannot finish leaves the
+   loop exactly where it was;
+4. and the watcher is restarted, because it reads `config.json` once, at startup.
+
+What a switch never does: touch `state.json` (no order is re-dispatched), touch a running
+agent, or drop a report. A report produced *while* the switch is running is an ordinary outbox
+entry, so it goes out exactly once, on the next pass.
+
+`ask-claude --switch-account` with no name prints which accounts exist, where each one lives,
+whether its window is up, and which chat it will drive. The watcher's own `status` names the
+planner it reports to, so "did the switch take?" is one line:
+
+```
+planner: spare account -> https://claude.ai/chat/bbbbbbbb-5555-6666-7777-888888888888
+```
 
 ---
 
@@ -767,10 +833,10 @@ How the bridge handles it:
 | `contrib/opencode.service` | optional systemd user unit for the opencode background server (the watcher supervises it by default) |
 | `agent-watch.py` | follow a running work-order agent live from any terminal |
 | `terminals/` | the tiny generated launcher scripts each agent's view runs (`<session>.sh` the agent itself, `tab-<session>.sh` the per-repository window) |
-| `start-bridge-chrome.sh` | launches/reuses the dedicated bridge Chrome window |
-| `bridge-up.sh` | after a restart: bridge window + sign-in check + watcher, in one go |
-| `config.json` | remembered `chat_url` + the `watch` settings |
-| `bridge-target.json` | the claude.ai tab the bridge drives (so extra tabs cannot steal a message) |
+| `start-bridge-chrome.sh` | launches/reuses the dedicated bridge Chrome window (for one account: `CLAUDE_BRIDGE_ACCOUNT=spare`) |
+| `bridge-up.sh` | after a restart: the active account's window + sign-in check + watcher, in one go |
+| `config.json` | `accounts` (profile, port, chat per account), `active_account`, and the `watch` settings |
+| `bridge-target-<account>.json` | the claude.ai tab the bridge drives for that account (so extra tabs cannot steal a message) |
 | `inbox/` | work orders Claude has handed over (`<id>.md`) |
 | `downloads/` | file cards fetched from the chat |
 | `drafts/` | the text of a draft `--clear` had to empty out of the composer (never sent, never lost) |
