@@ -3,6 +3,7 @@
 #   ./watcher.sh start|stop|restart|status|log|reap
 #   ./watcher.sh run                foreground, for a supervisor (the systemd user unit)
 #   ./watcher.sh prune-state        drop the start records of orders finished over a week ago
+#   ./watcher.sh unit               which systemd user unit supervises this home
 #   ./watcher.sh done WO-111        it reported DONE: free its agent slot now
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -11,7 +12,16 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # first - which is what keeps two loops from ever contending for one lock.  Unset, the home
 # is HERE, exactly as before.
 HOME_DIR="${CLAUDE_BRIDGE_HOME:-$HERE}"
-UNIT="${CLAUDE_BRIDGE_UNIT:-claude-bridge-watcher}"
+# The unit that supervises this watcher follows the *home* too, so one env var is enough: a
+# home that names its unit in config.json (watch.systemd_unit) is restarted through that
+# unit, never the other pipeline's.  An unnamed home - the coding loop - is
+# claude-bridge-watcher, exactly as before, and CLAUDE_BRIDGE_UNIT still wins outright.
+UNIT="${CLAUDE_BRIDGE_UNIT:-}"
+if [ -z "$UNIT" ]; then
+  UNIT="$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1])).get("watch") or {}).get("systemd_unit") or "")' \
+            "$HOME_DIR/config.json" 2>/dev/null || true)"
+  UNIT="${UNIT:-claude-bridge-watcher}"
+fi
 PID="$HOME_DIR/watcher.pid"
 LOCK="$HOME_DIR/watcher.lock"
 CMD="${1:-status}"
@@ -98,6 +108,10 @@ case "$CMD" in
   log)
     tail -n 40 -f "$HERE/watcher.log"
     ;;
+  unit)
+    # Which systemd user unit supervises *this* home - so a script can check before it acts.
+    echo "$UNIT"
+    ;;
   *)
-    echo "usage: $0 {start|stop|restart|status|log|reap|run|prune-state|done <WORK-ORDER-ID>}"; exit 2;;
+    echo "usage: $0 {start|stop|restart|status|log|reap|run|prune-state|unit|done <WORK-ORDER-ID>}"; exit 2;;
 esac

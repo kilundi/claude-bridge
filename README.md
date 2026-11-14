@@ -819,6 +819,12 @@ systemctl --user enable --now claude-bridge-video
 CLAUDE_BRIDGE_HOME=~/claude-bridge-video bash ~/claude-bridge/bridge-up.sh
 ```
 
+One env var is enough. The unit that supervises a loop is named in **that home's own**
+`config.json` (`watch.systemd_unit: claude-bridge-video`), so any command that can restart
+the watcher - a `--switch-account`, say - restarts *this* loop's unit and never the other
+one's; `watcher.sh unit` prints which unit a home resolves to. A home that names none (the
+coding loop) is still `claude-bridge-watcher`, and `CLAUDE_BRIDGE_UNIT` still wins outright.
+
 The two numbers in its `watch` block are the point. **`max_agents: 1`** gives video its own
 slot, so a video agent can never occupy one of the coding loop's two. **`min_free_mb: 1500`**
 is higher than the coding loop's 800 - the floor the coding loop *rejected* as too cautious is

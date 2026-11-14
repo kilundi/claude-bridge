@@ -1830,7 +1830,13 @@ def main(argv=None):
         use_account(args.account)
     if args.account_env:
         spec = account_spec(args.account) if args.account else use_account()
-        print("\t".join([PROFILE, str(PORT), spec["chat_url"] or "", spec["name"]]))
+        # No field may ever be empty.  The reader is `IFS=$'\t' read -r a b c d`, and a tab
+        # is IFS *whitespace*, so two adjacent tabs collapse into one delimiter and every
+        # field after the gap shifts left: an account with no chat yet would hand its NAME
+        # to the shell as the CHAT, and leave the name empty (bridge-up.sh then falls back
+        # to "main" and opens the *coding* window).  An account with no chat reads
+        # claude.ai/new - that is what target_url() does, so say so.
+        print("\t".join([PROFILE, str(PORT), spec["chat_url"] or NEW_CHAT_URL, spec["name"]]))
         return 0
     if args.switch_account is not None:
         if not args.switch_account:

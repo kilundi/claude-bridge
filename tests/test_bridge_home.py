@@ -173,6 +173,73 @@ def test_agent_watch_follows_the_home():
     return "the watcher reads the home's state, not the coding loop's"
 
 
+def test_the_unit_follows_the_home():
+    """A restart has to reach *this* pipeline's unit - one env var, never the other loop's."""
+    def unit_of(home, cfg=None, extra=None):
+        if cfg is not None:
+            with open(os.path.join(home, "config.json"), "w") as f:
+                json.dump(cfg, f)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_BRIDGE_")}
+        if home is not None:
+            env["CLAUDE_BRIDGE_HOME"] = home
+        env.update(extra or {})
+        p = subprocess.run(["bash", os.path.join(ROOT, "watcher.sh"), "unit"],
+                           env=env, capture_output=True, text=True)
+        assert p.returncode == 0, p.stderr
+        return p.stdout.strip()
+
+    named = tempfile.mkdtemp(prefix="video-home-")
+    assert unit_of(named, cfg={"watch": {"systemd_unit": "claude-bridge-video"}}) \
+        == "claude-bridge-video", "the video home must restart its own unit"
+    # a home that names no unit - and a home with no config at all - are the coding loop's
+    assert unit_of(tempfile.mkdtemp(prefix="plain-home-"), cfg={"watch": {"interval": 30}}) \
+        == "claude-bridge-watcher"
+    assert unit_of(tempfile.mkdtemp(prefix="empty-home-")) == "claude-bridge-watcher"
+    # with nothing set at all, nothing changed
+    assert unit_of(None) == "claude-bridge-watcher"
+    # and the explicit variable still wins outright (the unit file keeps using it)
+    assert unit_of(named, cfg={"watch": {"systemd_unit": "claude-bridge-video"}},
+                   extra={"CLAUDE_BRIDGE_UNIT": "elsewhere"}) == "elsewhere"
+    return "a home names its own unit; unnamed, it is still claude-bridge-watcher"
+
+
+def test_account_env_never_prints_an_empty_field():
+    """The reader is `IFS=$'\t' read`, and a tab is IFS whitespace: one empty field shifts
+    every later one.  An unsigned account used to hand the shell its NAME as the CHAT and an
+    empty name, so bridge-up.sh fell back to "main" and opened the *coding* window."""
+    home = tempfile.mkdtemp(prefix="video-home-")
+    chat_main = "https://claude.ai/chat/2999ac04-5f70-49d5-8925-fb516e7232ba"
+    with open(os.path.join(home, "config.json"), "w") as f:
+        json.dump({"accounts": {
+            "main": {"profile": "/p/main", "port": 9222, "chat_url": chat_main},
+            "spare": {"profile": "/p/spare", "port": 9223, "chat_url": ""}},
+            "active_account": "spare"}, f)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_BRIDGE_")}
+    env["CLAUDE_BRIDGE_HOME"] = home
+
+    def env_line(*args):
+        p = subprocess.run([sys.executable, os.path.join(ROOT, "bridge.py"), "--account-env",
+                            *args], env=env, capture_output=True, text=True)
+        assert p.returncode == 0, p.stderr
+        return p.stdout.strip()
+
+    line = env_line()                      # the active account: spare, signed in never
+    fields = line.split("\t")
+    assert len(fields) == 4 and all(fields), fields
+    assert fields[3] == "spare" and fields[2] == bridge.NEW_CHAT_URL, fields
+
+    # what a shell really sees - this is the assertion the bug would fail
+    shell = 'IFS=$\'\\t\' read -r a_profile a_port a_chat a_name <<<"$1"; ' \
+            'printf "%s|%s|%s" "$a_port" "$a_chat" "$a_name"'
+    seen = subprocess.run(["bash", "-c", shell, "bash", line],
+                          capture_output=True, text=True)
+    assert seen.stdout == "9223|%s|spare" % bridge.NEW_CHAT_URL, seen.stdout
+
+    # the signed-in account is untouched by any of this
+    assert env_line("--account", "main").split("\t")[2] == chat_main
+    return "an account with no chat yet still hands the shell four unshifted fields"
+
+
 def main() -> int:
     checks = [
         ("home moves every data path", test_the_home_moves_every_data_path),
@@ -182,6 +249,8 @@ def main() -> int:
         ("unsigned account keeps its own chat", test_an_unsigned_account_never_reads_the_coding_chat),
         ("advice names the right home", test_the_advice_names_the_right_home),
         ("agent-watch follows the home", test_agent_watch_follows_the_home),
+        ("the unit follows the home", test_the_unit_follows_the_home),
+        ("account-env has no empty field", test_account_env_never_prints_an_empty_field),
     ]
     failed = 0
     for name, fn in checks:
