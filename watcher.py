@@ -1229,6 +1229,7 @@ def build_prompt(order: dict, files: list[dict], inbox_path: str) -> str:
         for p in order["missing_files"]:
             lines.append("  - %s" % p)
         lines.append("")
+    report = report_file(order["id"])
     lines += [
         "When Claude says to save a file in a particular directory or at a particular path, do exactly that:",
         "write the file there (create the directory if needed), and copy any attached file listed above to the",
@@ -1237,8 +1238,16 @@ def build_prompt(order: dict, files: list[dict], inbox_path: str) -> str:
         "",
         "The full order, exactly as Claude wrote it, is saved at %s." % inbox_path,
         "",
-        "Do the work: make the change, run the checks, and commit and push to the branch above.",
-        "When you are finished, send your DONE report to the planner with the ask_claude tool:",
+    ]
+    if order.get("branch"):
+        lines.append("Do the work: make the change, run the checks, and commit and push to the "
+                     "branch above.")
+    else:
+        lines.append("Do the work: make the change and run the checks the order asks for, and "
+                     "commit and push it if this project is a git repository.")
+    lines += [
+        "",
+        "Write your DONE report in this shape:",
         "  DONE",
         "  - project: <name>",
         "  - branch: <branch>",
@@ -1247,10 +1256,30 @@ def build_prompt(order: dict, files: list[dict], inbox_path: str) -> str:
         "  - notes: <anything odd, or a question>",
         "  NEXT: what should I take on?",
         "",
-        "Save that same report to %s as well - that file appearing is what marks this order"
-        % report_file(order["id"]),
-        "finished and frees its slot for the next one, with nobody having to notice the report",
-        "first. Then stop: a continuation arrives as a new work order, not in this session.",
+    ]
+    if HOME == HERE:
+        lines += [
+            "Send that report to the planner with the ask_claude tool, and save the same text to",
+            "%s as well - that file appearing is what marks this order" % report,
+            "finished and frees its slot for the next one, with nobody having to notice the report",
+            "first.",
+        ]
+    else:
+        # A second pipeline's planner is a different chat reached through a different home, and
+        # ask_claude is one global tool wired to the *coding* chat (the opencode server starts it
+        # with no CLAUDE_BRIDGE_HOME, so it resolves the coding home).  An agent that used it here
+        # would post a report into the coding planner's thread, which that planner would read as
+        # coding work - the one contamination this whole separation exists to prevent.  The file
+        # goes to *this* pipeline's planner, and nothing has to be noticed for that to happen.
+        lines += [
+            "Save it to %s - that file appearing is what marks this order" % report,
+            "finished and frees its slot for the next one, and the loop posts it to the planner of",
+            "*this* pipeline.",
+            "Do NOT use the ask_claude tool for this: it is wired to a different pipeline's planner,"
+            " a different chat that would read your report as its own work. Write the file instead.",
+        ]
+    lines += [
+        "Then stop: a continuation arrives as a new work order, not in this session.",
         "If you are blocked on something only the person can decide, say so plainly in the",
         "report - your slot is freed while you wait, and your window is kept open for the",
         "answer.",

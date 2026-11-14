@@ -240,6 +240,30 @@ def test_account_env_never_prints_an_empty_field():
     return "an account with no chat yet still hands the shell four unshifted fields"
 
 
+def test_a_second_pipeline_reports_by_file():
+    """ask_claude is one global tool, wired to the coding chat: a video agent that used it
+    would post a video report into the coding planner's thread, which would read it as
+    coding work.  A second pipeline's agent writes the report file instead."""
+    order = {"id": "WO-200", "session": "ses_e2a758dc0ffe6naxYQwxm0YXpF",
+             "dir": "/home/kilundi/code-video", "branch": "", "save": "",
+             "goal": "inventory the toolchain", "acceptance": "a report.md exists",
+             "raw": "id: WO-200", "missing_files": []}
+    home, reports = watcher.HOME, watcher.REPORTS
+    try:
+        watcher.HOME = watcher.HERE
+        plain = watcher.build_prompt(order, [], "/tmp/inbox.md")
+        assert "with the ask_claude tool" in plain, plain[-400:]
+        watcher.HOME = "/tmp/some-video-home"
+        watcher.REPORTS = "/tmp/some-video-home/reports"
+        moved = watcher.build_prompt(order, [], "/tmp/inbox.md")
+        assert "with the ask_claude tool" not in moved, moved[-500:]
+        assert "Do NOT use the ask_claude tool" in moved, moved[-500:]
+        assert "/tmp/some-video-home/reports/WO-200.md" in moved, moved[-500:]
+    finally:
+        watcher.HOME, watcher.REPORTS = home, reports
+    return "a second pipeline's agent writes the report file, never the coding chat"
+
+
 def main() -> int:
     checks = [
         ("home moves every data path", test_the_home_moves_every_data_path),
@@ -251,6 +275,7 @@ def main() -> int:
         ("agent-watch follows the home", test_agent_watch_follows_the_home),
         ("the unit follows the home", test_the_unit_follows_the_home),
         ("account-env has no empty field", test_account_env_never_prints_an_empty_field),
+        ("a second pipeline reports by file", test_a_second_pipeline_reports_by_file),
     ]
     failed = 0
     for name, fn in checks:
