@@ -355,6 +355,40 @@ def test_state_prunes_only_old_finished_orders() -> str:
     return "old finished start records go; live, recent, finished and hash marks all stay"
 
 
+def test_a_finished_order_keeps_no_marks_at_all() -> str:
+    """`watcher.sh done` popped the marks, and the next save put them straight back.
+
+    `save_state` merges everything except `held` (a second process must not have its marks
+    reverted), so when the watcher - which holds a state copy for the whole pass - saved
+    after the pop, the pop lost.  Six closed orders went on advertising themselves that way.
+    The watcher owns these maps, so the drop happens in the pass, where no race can win.
+    """
+    tmp_env()
+    st = state(("WO-600", "ses_a", 60))
+    st["finished"] = {"WO-601": time.time()}
+    st["resume"] = {"WO-601": {"count": 3, "at": 1}, "WO-600": {"count": 1, "at": 1}}
+    st["waiting"] = {"WO-601": time.time()}
+    st["held"] = {"WO-601": time.time()}
+    assert watcher.tidy_marks(st) == ["WO-601"]
+    assert st["resume"] == {"WO-600": {"count": 1, "at": 1}}, st["resume"]
+    assert st["waiting"] == {} and st["held"] == {}, (st["waiting"], st["held"])
+    # the save cannot resurrect them, even from a copy taken before the finish
+    stale = {"finished": {}, "resume": {"WO-601": {"count": 3, "at": 1}}}
+    watcher.save_state(dict(st))
+    watcher.save_state(stale)          # a stale writer's save, exactly the race in the wild
+    on_disk = json.load(open(watcher.STATE))
+    assert "WO-600" in on_disk["resume"], "another process's marks for a live order still merge"
+    assert "WO-601" not in on_disk["resume"], \
+        "a finished order's resume mark came back out of the merged file: %s" % on_disk["resume"]
+    # status says nothing about it either
+    watcher.session_activity = make_activity({"WO-600": 60})
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        watcher.report_status(cfg(), on_disk)
+    assert "WO-601" not in buf.getvalue(), buf.getvalue()
+    return "a finished order carries no resume, waiting or held mark, and status agrees"
+
+
 def test_a_repeated_line_is_said_once() -> str:
     """312 ``could not read`` and 125 ``no longer in the chat`` lines: the same fact per pass.
 
@@ -1156,6 +1190,7 @@ def main() -> int:
         ("a report file finishes the order", test_a_report_file_finishes_the_order),
         ("an unsent report is queued", test_a_report_file_never_sent_is_queued_for_the_planner),
         ("a finished order drops its mark", test_a_finished_order_drops_its_waiting_mark),
+        ("a finished order keeps no marks", test_a_finished_order_keeps_no_marks_at_all),
         ("a transcript report finishes too", test_a_report_in_the_transcript_finishes_the_order_too),
         ("status says what is running", test_status_says_what_is_running),
     ]

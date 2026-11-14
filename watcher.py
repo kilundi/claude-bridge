@@ -144,9 +144,19 @@ def save_state(st: dict) -> None:
     # the transcript every pass - a wait that is over, an order that has just started,
     # one the chat has scrolled past - and a union with the file would resurrect exactly
     # those: `watcher.sh done WO-116` popped the marker and the next save put it back, so
-    # a finished order kept showing as waiting for a slot.  Everything else merges, so a
-    # second process's marks are never reverted.
+    # a finished order kept showing as waiting for a slot.
     merged["held"] = dict(st.get("held") or {})
+    # And no *finished* order may keep a resume or waiting mark, whatever a stale copy still
+    # says: merge puts one back every save otherwise, which is how WO-109 and WO-111-WO-114
+    # went on reading as "resumed 3 time(s) - have a look at it" for days after they were
+    # closed.  Only the rule is applied here, not the whole map: a second process's marks for
+    # *live* orders are still merged, so a resume that is in cooldown stays in cooldown.
+    done = set(merged.get("finished") or {})
+    for key in ("resume", "waiting"):
+        marks = merged.get(key)
+        if isinstance(marks, dict):
+            for oid in [o for o in marks if o in done]:
+                marks.pop(oid, None)
     _apply_inplace(st, merged)
     tmp = "%s.%d.tmp" % (STATE, os.getpid())
     with open(tmp, "w") as fh:
@@ -1654,6 +1664,29 @@ def finish_order(st: dict, oid: str) -> None:
     save_state(st)
 
 
+def tidy_marks(st: dict) -> list[str]:
+    """Drop the marks a *finished* order must not carry: resume, waiting, held.
+
+    ``save_state`` merges everything except ``held``, so a pop by ``watcher.sh done`` is
+    reverted by the very next save if the watcher is holding a copy from before it - which
+    is the normal case, since it holds one for the whole pass.  The watcher owns these maps,
+    so it does the dropping itself, every pass, where no race can win: WO-109, WO-111-WO-114,
+    WO-139 and WO-157 all sat in ``resume`` for days after they were finished, and `status`
+    advertised *"resumed 3 time(s) - have a look at it"* about closed orders.
+    """
+    done = set(st.get("finished") or {})
+    gone: list[str] = []
+    for key in ("resume", "waiting", "held"):
+        marks = st.get(key)
+        if not isinstance(marks, dict):
+            continue
+        for oid in [o for o in marks if o in done]:
+            marks.pop(oid, None)
+            if oid not in gone:
+                gone.append(oid)
+    return gone
+
+
 def note_waiting(st: dict, verdicts: dict) -> list[str]:
     """Record the agents whose turn is parked on a person, for status and reap.
 
@@ -1917,6 +1950,7 @@ def pass_once(cfg: dict, st: dict, dry_run: bool = False) -> dict:
             "any running order lost its turn with it"
             % (restarted.get("from"), restarted.get("to"), why))
     activity = [] if dry_run else session_activity(cfg, st)
+    tidy_marks(st)
     verdicts: dict[str, str] = {}
     if activity:
         # One probe per session for the whole pass: the same reading decides the slot
@@ -2139,6 +2173,8 @@ def report_status(cfg: dict, st: dict) -> int:
         ago = ("%.0f min ago" % (age / 60)) if age is not None else "unknown"
         print("  %-7s %-16s last moved %s" % (oid, state, ago))
     for oid, r in sorted((st.get("resume") or {}).items()):
+        if oid in done:
+            continue              # a finished order is not going to be resumed by anybody
         n = int(r.get("count") or 0)
         print("  %-7s resumed %d time(s)%s"
               % (oid, n, " - have a look at it" if n >= int(w.get("resume_max", 3)) else ""))
