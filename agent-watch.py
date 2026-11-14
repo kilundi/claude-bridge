@@ -24,7 +24,13 @@ import time
 from datetime import datetime
 
 HOME = os.path.expanduser("~")
-BRIDGE = os.environ.get("CLAUDE_BRIDGE") or os.path.join(HOME, "claude-bridge")
+# Which loop to follow.  CLAUDE_BRIDGE_HOME is the same switch the watcher and the bridge
+# take - a second pipeline keeps its state in its own home - and CLAUDE_BRIDGE is the older
+# explicit override, still honoured.
+BRIDGE = os.path.expanduser(
+    os.environ.get("CLAUDE_BRIDGE_HOME")
+    or os.environ.get("CLAUDE_BRIDGE")
+    or os.path.join(HOME, "claude-bridge"))
 OC = os.environ.get("OPENCODE_BIN") or os.path.join(HOME, ".opencode", "bin", "opencode")
 TMPDIR = "/tmp/opencode" if os.path.isdir("/tmp/opencode") else tempfile.gettempdir()
 

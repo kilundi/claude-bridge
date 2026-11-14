@@ -157,6 +157,22 @@ def test_the_advice_names_the_right_home():
     return "the coding loop gets the plain command; a second home gets its own"
 
 
+def test_agent_watch_follows_the_home():
+    """Following an agent has to follow the *right* loop: video agents are not coding ones."""
+    home = tempfile.mkdtemp(prefix="video-home-")
+    with open(os.path.join(home, "state.json"), "w") as f:
+        json.dump({"sessions": {}, "starts": {}}, f)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_BRIDGE_")}
+    env["CLAUDE_BRIDGE_HOME"] = home
+    p = subprocess.run([sys.executable, os.path.join(ROOT, "agent-watch.py"), "--once"],
+                       env=env, capture_output=True, text=True)
+    assert p.returncode != 0, "an empty home has nothing to follow: %s" % p.stdout
+    out = p.stdout + p.stderr
+    assert os.path.join(home, "state.json") in out, \
+        "it read %s instead of the home: %s" % (home, out[-400:])
+    return "the watcher reads the home's state, not the coding loop's"
+
+
 def main() -> int:
     checks = [
         ("home moves every data path", test_the_home_moves_every_data_path),
@@ -165,6 +181,7 @@ def main() -> int:
         ("no env means today's paths", test_no_env_means_todays_paths),
         ("unsigned account keeps its own chat", test_an_unsigned_account_never_reads_the_coding_chat),
         ("advice names the right home", test_the_advice_names_the_right_home),
+        ("agent-watch follows the home", test_agent_watch_follows_the_home),
     ]
     failed = 0
     for name, fn in checks:
