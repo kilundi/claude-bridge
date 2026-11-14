@@ -34,7 +34,7 @@ sys.path.insert(0, HERE)
 
 import wlock  # noqa: E402
 from bridge import (Bridge, ClaudeUnavailable, cdp_alive, ensure_chrome,  # noqa: E402
-                    extract_work_orders, order_problems, outbox_files)
+                    extract_work_orders, order_problems, outbox_files, queue_message)
 
 CONFIG = os.path.join(HERE, "config.json")
 STATE = os.path.join(HERE, "state.json")
@@ -643,8 +643,17 @@ def agent_busy(cfg: dict, st: dict, now: float | None = None) -> dict:
 
     For callers that ask only that (the ask logic).  A pass already holds the
     activity list, so it uses ``live_agents`` on that instead of re-reading here.
+
+    An order marked finished is not a worker, whatever its session is doing: the
+    person may still be typing in that window, which keeps the transcript moving.
+    ``slot_agents`` has always left those out; this path did not, and on 2026-11-12
+    WO-130's finished window sat here and answered "WO-130 is still working" on every
+    pass - so the ask WO-149 needed (its block had no ``acceptance`` line) was held
+    forever and the queue never moved.  A live transcript is not evidence of work;
+    a *finished* order is evidence there is none.
     """
-    live = live_agents(session_activity(cfg, st, now=now))
+    live = [a for a in live_agents(session_activity(cfg, st, now=now))
+            if not a.get("finished")]
     return live[-1] if live else {}
 
 
@@ -1413,16 +1422,50 @@ def note_waiting(st: dict, verdicts: dict) -> list[str]:
     ``verdicts`` is this pass's ``order -> _turn_verdict`` map, so the slot count, the
     status rows and this mark are all the same reading of the same turn.  An order that
     was parked and is not any more drops the mark: it has been answered, and it is
-    working again.  Returns the orders that have just parked, for the log.
+    working again.  A *finished* order never holds a mark either - its window is not
+    waiting for anything, and a mark left behind made reaping treat a done order's view as
+    parked (WO-130 and WO-148 both outlived their orders by days that way).  Returns the
+    orders that have just parked, for the log.
     """
     wait = st.setdefault("waiting", {})
     was = set(wait)
+    done = set(st.get("finished") or {})
     for oid, v in verdicts.items():
-        if v == "waiting":
+        if v == "waiting" and oid not in done:
             wait.setdefault(oid, time.time())    # keep the moment it asked
         else:
             wait.pop(oid, None)
     return sorted(set(wait) - was)
+
+
+def queue_report(st: dict, oid: str) -> str | None:
+    """Queue an agent's report file for the planner, when the agent never sent it.
+
+    A report file is proof the *work* is done - that is what frees the slot - but it is not
+    proof the planner ever read it.  On 2026-11-13 WO-157 wrote ``reports/WO-157.md``, its
+    order was finished from that file, and the planner answered *"WO-157 was posted earlier
+    and I haven't seen its report"*: the queue stopped on a report that was written and
+    never delivered.  The outbox is the delivery the watcher already flushes
+    (``Bridge.flush_outbox``), so the file goes there and out on the next pass, saying where
+    it came from.  Called once per order: a finished order never runs this again.
+    """
+    path = report_file(oid)
+    try:
+        with open(path) as fh:
+            body = fh.read().strip()
+    except Exception as e:
+        log("  could not read %s to queue it: %s" % (path, e))
+        return None
+    if not body:
+        return None
+    note = ("[%s wrote this to %s and its own report never reached you, so the watcher is "
+            "sending it.  Treat it as that order's report.]" % (oid, os.path.basename(path)))
+    try:
+        return queue_message("%s\n\n%s" % (body, note),
+                             reason="the report file of %s, never sent by its agent" % oid)
+    except Exception as e:
+        log("  could not queue %s's report: %s" % (oid, e))
+        return None
 
 
 def finish_reported_orders(cfg: dict, st: dict, activity: list[dict], verdicts: dict,
@@ -1437,6 +1480,10 @@ def finish_reported_orders(cfg: dict, st: dict, activity: list[dict], verdicts: 
     * the report in the agent's own transcript (:func:`reported_done`), which catches a
       report sent the usual way without an agent having to do anything new - checked
       once per turn, and it costs one small read per candidate.
+
+    Finishing from the file *alone* also queues that file for the planner
+    (:func:`queue_report`): the slot is freed either way, but a report the planner never
+    saw leaves the loop waiting on work that is already done.
     """
     done = st.get("finished") or {}
     out: list[str] = []
@@ -1446,14 +1493,22 @@ def finish_reported_orders(cfg: dict, st: dict, activity: list[dict], verdicts: 
             continue                        # finished already, or still in a turn
         if (st.get("starts") or {}).get(oid, {}).get("status") != "started":
             continue
-        if os.path.exists(report_file(oid)):
+        on_file = os.path.exists(report_file(oid))
+        reported = bool(check and check(oid, a.get("session") or "", a.get("last")))
+        if on_file:
             why = "left %s" % os.path.basename(report_file(oid))
-        elif check and check(oid, a.get("session") or "", a.get("last")):
+        elif reported:
             why = "reported DONE in its transcript"
         else:
             continue
         finish_order(st, oid)
         log("%s is finished - its agent %s, so its slot is free" % (oid, why))
+        if on_file and not reported:
+            # the file is proof the work is done, not that the planner ever saw it
+            queued = queue_report(st, oid)
+            if queued:
+                log("  %s finished on its report file alone - queued %s for the planner"
+                    % (oid, os.path.basename(queued)))
         out.append(oid)
     return out
 

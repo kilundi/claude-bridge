@@ -25,6 +25,7 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+import bridge  # noqa: E402
 import watcher  # noqa: E402
 
 # tmp_env() stubs session_activity so no proof can touch the API by accident; the two
@@ -41,6 +42,9 @@ def tmp_env(tmp=None) -> str:
     watcher.DOWNLOADS = os.path.join(d, "downloads")
     watcher.NEEDS_ORDER = os.path.join(d, "NEEDS-ORDER.md")
     watcher.REPORTS = os.path.join(d, "reports")
+    # the outbox too: a report finished from its file alone is queued for the planner, and a
+    # test must never put anything in the real one
+    bridge.OUTBOX = os.path.join(d, "outbox")
     os.makedirs(watcher.INBOX, exist_ok=True)
     os.makedirs(watcher.DOWNLOADS, exist_ok=True)
     # a test must never open, or close, a real window on the user's desktop, and must
@@ -639,6 +643,39 @@ def test_a_finished_order_holds_no_slot() -> str:
         watcher.report_status(cfg(), st)
     assert "0 of 2 slots used" in buf.getvalue(), buf.getvalue()
     return "a finished order's session is not a worker, even when its window is being poked"
+  
+  
+def test_a_finished_order_is_not_busy_to_the_ask() -> str:
+    """The ask path must not wait behind a finished order's window (WO-149).
+
+    The order arrived without an ``acceptance`` line, so the watcher's job was to ask
+    Claude to re-post it - and it never did: ``agent_busy`` read ``live_agents`` alone,
+    and the finished WO-130 session was live only because the person was still typing in
+    that window.  Every pass answered "WO-130 is still working", the ask was held, and a
+    complete order stood still with both slots free.
+    """
+    tmp_env()
+    st = state(("WO-380", "ses_a", 10))          # just moved: live, and not finished
+    watcher.session_activity = make_activity({"WO-380": 10})
+    assert watcher.agent_busy(cfg(), st).get("order") == "WO-380", st
+    st["finished"] = {"WO-380": time.time()}
+    assert watcher.live_agents(watcher.session_activity(cfg(), st)), "the window is still live"
+    assert watcher.agent_busy(cfg(), st) == {}, watcher.agent_busy(cfg(), st)
+    # a live *unfinished* agent is still busy, and the newest start is the one named
+    st2 = state(("WO-381", "ses_b", 10), ("WO-382", "ses_c", 5))
+    st2["finished"] = {"WO-380": time.time()}
+    watcher.session_activity = make_activity({"WO-381": 10, "WO-382": 5})
+    assert watcher.agent_busy(cfg(), st2).get("order") == "WO-382", st2
+    # and with only finished agents live, the ask is free to go out
+    st3 = state(("WO-383", "ses_d", 5))
+    st3["finished"] = {"WO-383": time.time()}
+    watcher.session_activity = make_activity({"WO-383": 5})
+    plan = watcher.plan_attention(
+        {"nudge": {"streak": 0, "at": 0}}, "here is a promise of work",
+        {"dispatch": [], "incomplete": [({"id": "WO-384"}, ["acceptance"])],
+         "duplicate": [], "ignored": []}, watcher.agent_busy(cfg(), st3), cfg())
+    assert plan["action"] == "ask", plan
+    return "a finished window is not 'working': the watcher asks Claude about the half order"
 
 
 # --- the report that frees its own slot -------------------------------------------------
@@ -668,6 +705,68 @@ def test_a_report_file_finishes_the_order() -> str:
     assert watcher.finish_reported_orders(cfg(), st2, make_activity({"WO-353": 600})(cfg(), st2),
                                           {"WO-353": "working"}) == []
     return "the report file finishes the order, so the slot frees with nobody watching"
+
+
+def test_a_report_file_never_sent_is_queued_for_the_planner() -> str:
+    """WO-157: the file freed the slot while the planner was still waiting for the report.
+
+    Its order was finished from ``reports/WO-157.md`` at 13:03 on 2026-11-13 - and the
+    planner was saying *"WO-157 was posted earlier and I haven't seen its report"*, with an
+    empty outbox, so nothing had even tried to deliver it.  A finish from the file *alone*
+    now queues that file, which is the delivery the watcher already flushes.
+    """
+    tmp_env()
+    # the agent sent its report the usual way as well: nothing to re-send
+    st = state(("WO-390", "ses_a", 600))
+    act = make_activity({"WO-390": 600})(cfg(), st)
+    os.makedirs(watcher.REPORTS, exist_ok=True)
+    with open(watcher.report_file("WO-390"), "w") as fh:
+        fh.write("DONE\n- project: wms-api (docs/CLIENT-DEPLOYMENT.md)\n- commits: b3e9771\n")
+    got = watcher.finish_reported_orders(cfg(), st, act, {"WO-390": "idle"},
+                                         check=lambda oid, sid, moved: True)
+    assert got == ["WO-390"], got
+    assert watcher.outbox_files() == [], "a report its agent sent is never sent twice"
+    # the same, except its agent never sent anything: the file is all the planner gets
+    st2 = state(("WO-391", "ses_b", 600))
+    act2 = make_activity({"WO-391": 600})(cfg(), st2)
+    with open(watcher.report_file("WO-391"), "w") as fh:
+        fh.write("DONE\n- project: wms-api\n- tests: 30 suites / 252 tests passed\n")
+    got = watcher.finish_reported_orders(cfg(), st2, act2, {"WO-391": "idle"},
+                                         check=lambda oid, sid, moved: False)
+    assert got == ["WO-391"], got
+    queued = watcher.outbox_files()
+    assert len(queued) == 1, queued
+    with open(queued[0]) as fh:
+        raw = fh.read()
+    assert "never sent by its agent" in raw, raw          # why the watcher is sending it
+    body = bridge.read_queued(queued[0])
+    assert body.startswith("DONE\n- project: wms-api"), body
+    assert "252 tests passed" in body, body
+    assert "its own report never reached you" in body, "the planner is told where it came from"
+    # and it is queued once: the order is finished, so nothing runs this again
+    assert watcher.finish_reported_orders(cfg(), st2, act2, {"WO-391": "idle"}) == []
+    assert len(watcher.outbox_files()) == 1, "the same report was queued twice"
+    return "a report that was written and never sent is queued once, and says where it came from"
+
+
+def test_a_finished_order_drops_its_waiting_mark() -> str:
+    """WO-130 and WO-148 sat in `waiting` for days after they were finished.
+
+    A finish removes the mark, and a later pass re-added it: the verdict for a finished
+    order's session still reads "parked".  Status hides it (finished wins the row), but
+    reaping treats a parked order's view as one somebody is answering and never closes it.
+    """
+    tmp_env()
+    st = state(("WO-395", "ses_a", 60))
+    st["waiting"] = {"WO-395": time.time() - 3 * 86400}
+    st["finished"] = {"WO-395": time.time() - 2 * 86400}
+    assert watcher.note_waiting(st, {"WO-395": "waiting"}) == []
+    assert st["waiting"] == {}, st["waiting"]
+    # a live, unfinished order that parks still parks
+    st2 = state(("WO-396", "ses_b", 60))
+    assert watcher.note_waiting(st2, {"WO-396": "waiting"}) == ["WO-396"]
+    assert sorted(st2["waiting"]) == ["WO-396"], st2["waiting"]
+    return "a finished order never holds a waiting mark, so no view is treated as parked"
 
 
 def test_a_report_in_the_transcript_finishes_the_order_too() -> str:
@@ -810,8 +909,11 @@ def main() -> int:
         ("a launched tab is kept", test_a_view_just_launched_for_an_old_agent_is_kept),
         ("a parked turn frees its slot", test_a_parked_turn_frees_its_slot),
         ("a finished order holds no slot", test_a_finished_order_holds_no_slot),
+        ("a finished order is not busy", test_a_finished_order_is_not_busy_to_the_ask),
         ("a parked window stays, no resume", test_a_parked_window_is_neither_reaped_nor_resumed),
         ("a report file finishes the order", test_a_report_file_finishes_the_order),
+        ("an unsent report is queued", test_a_report_file_never_sent_is_queued_for_the_planner),
+        ("a finished order drops its mark", test_a_finished_order_drops_its_waiting_mark),
         ("a transcript report finishes too", test_a_report_in_the_transcript_finishes_the_order_too),
         ("status says what is running", test_status_says_what_is_running),
     ]
