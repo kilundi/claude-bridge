@@ -216,7 +216,18 @@ def oc_api(binpath: str, method: str, path: str, payload: dict | None = None, ti
     cmd = [binpath, "api", method, path]
     if payload is not None:
         cmd += ["-d", json.dumps(payload)]
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        # A service that is *slow* is as dangerous as one that is down: the client we just
+        # started is itself a second starter, and any server it brings up replaces the
+        # registered one - killing every in-flight turn.  Arming the same memory as
+        # "Background service failed to start" means the rest of this pass stops probing
+        # instead of charging the full timeout once per session - which is what let a slow
+        # service become the herd the memo exists to prevent (11-16: a 30 s read timed out,
+        # the next probe started a server, the live turns died, every agent looked stuck).
+        note_service_down("the API did not answer within %ss" % timeout)
+        raise RuntimeError("opencode api timed out after %ss: %s" % (timeout, path)) from e
     if p.returncode != 0:
         text = (p.stdout or "") + (p.stderr or "")
         if "Background service failed to start" in text:
@@ -588,14 +599,31 @@ def ensure_service(cfg: dict, st: dict, dry_run: bool = False) -> bool:
     return True
 
 
-def _moved_at(binp: str, sid: str) -> float | None:
+# One reading of a session's record costs a whole `opencode` process, and a single pass
+# asks for the same session several times (the slot pass, the resume, the status views).
+# A reading this fresh is the same reading, so keep it - exactly as _turn_verdict does for
+# the transcript, and for the same reason: a client whose server is struggling is what
+# starts a second one.
+MOVED_MEMO_TTL = 15.0
+_MOVED_MEMO: dict[str, tuple[float, float | None]] = {}
+
+
+def _moved_at(binp: str, sid: str, ttl: float = MOVED_MEMO_TTL) -> float | None:
     """When this session last moved, from its own record.
 
     Deliberately not the transcript: a long session's message page is big enough that
     the CLI's output is truncated mid-JSON (261 KB, unterminated string), which would
     read as "unknown" exactly when an agent has the most work behind it.  The session
     record is a few hundred bytes and carries ``time.updated``.
+
+    Cached for ``ttl`` seconds: every read costs a whole ``opencode`` process, and one
+    pass asks about the same session more than once (the slot pass, the resume, the status
+    views), so without this the order book is a herd of clients per pass - and a client
+    with a struggling server is exactly what starts a second one (see :func:`oc_api`).
     """
+    hit = _MOVED_MEMO.get(sid)
+    if ttl and hit and time.time() - hit[0] < ttl:
+        return hit[1]
     data = oc_api(binp, "GET", "/api/session/%s" % sid, timeout=30)
     data = data.get("data") if isinstance(data, dict) else data
     if not isinstance(data, dict):
@@ -604,8 +632,12 @@ def _moved_at(binp: str, sid: str) -> float | None:
     for key in ("updated", "created"):
         v = t.get(key)
         if isinstance(v, (int, float)):
-            return v / 1000.0
-    return None
+            answer: float | None = v / 1000.0
+            break
+    else:
+        answer = None
+    _MOVED_MEMO[sid] = (time.time(), answer)
+    return answer
 
 
 # A slot belongs to a running agent, and the only honest way to know is to look at the

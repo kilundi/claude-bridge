@@ -47,6 +47,9 @@ def tmp_env(tmp=None) -> str:
     # from neither, or the first proof's lines hide the second proof's
     watcher._SAID.clear()
     watcher._SERVICE_DOWN.clear()
+    # the record-read memo too: it is process-wide, so one proof's reading of a session
+    # would otherwise answer the next proof's question about the same session id
+    watcher._MOVED_MEMO.clear()
     # the outbox too: a report finished from its file alone is queued for the planner, and a
     # test must never put anything in the real one
     bridge.OUTBOX = os.path.join(d, "outbox")
@@ -258,6 +261,43 @@ def test_a_probe_never_starts_a_second_service() -> str:
         watcher.subprocess.run = real_run
         watcher._SERVICE_DOWN.clear()
     return "a down service is probed once, not once per session, and recovery is noticed"
+
+
+def test_a_timed_out_probe_is_not_a_starter() -> str:
+    """A *slow* service is as dangerous as a dead one, and the memo must cover it too.
+
+    11-16: a read timed out after 30 s, but the daemon had not said "Background service
+    failed to start" - it was only slow - so the old code armed nothing.  The pass that
+    followed probed every session again, each probe a client that can start a second
+    server, and a replacement server kills every in-flight turn: agents went quiet and had
+    to be told to continue.  A timeout has to arm the same latch as a refusal.
+    """
+    tmp_env()
+    calls: list[list[str]] = []
+
+    def slow(cmd, **kw):
+        calls.append(cmd)
+        raise watcher.subprocess.TimeoutExpired(cmd, kw.get("timeout", 30))
+
+    real_run = watcher.subprocess.run
+    try:
+        watcher.subprocess.run = slow
+        errors: list[str] = []
+        for sid in ("ses_1", "ses_2", "ses_3"):
+            try:
+                watcher._moved_at("/bin/true", sid)
+            except Exception as e:
+                errors.append(str(e))
+        assert len(calls) == 1, \
+            "one slow read arms the latch; it must not charge the timeout per session: %d" \
+            % len(calls)
+        assert len(errors) == 3 and "service is down" in errors[2], errors
+        logtext = open(watcher.LOG).read()
+        assert "did not answer within" in logtext, logtext
+    finally:
+        watcher.subprocess.run = real_run
+        watcher._SERVICE_DOWN.clear()
+    return "a timed-out read arms the down latch, so a slow service is probed once, not per session"
 
 
 def test_a_replacement_says_who_did_it() -> str:
@@ -631,6 +671,28 @@ def test_activity_reads_the_record() -> str:
     return "liveness comes from the session's own timestamps, not its outcome field"
 
 
+def test_a_record_is_read_once_per_pass() -> str:
+    """One pass asks about a session several times; each ask used to be a whole process.
+
+    The order book is 76 sessions and a pass reads each one for the slot count, the resume
+    and the status views.  Every read spawns an ``opencode`` client - the herd - so the
+    reading is kept for a few seconds, and a caller that needs a fresh one drops it.
+    """
+    tmp_env()
+    st = state(("WO-402", "ses_a", 30),)
+    watcher.oc_api, calls = stub_api({"ses_a": 30})
+    first = REAL_SESSION_ACTIVITY(cfg(), st)
+    again = REAL_SESSION_ACTIVITY(cfg(), st)      # the resume and the views ask too
+    assert len(calls) == 1, "the record is read once per session per pass: %d" % len(calls)
+    assert first[0]["last"] == again[0]["last"], (first, again)
+    # and a reading that has aged out is asked for again
+    watcher._MOVED_MEMO.clear()
+    moved = REAL_SESSION_ACTIVITY(cfg(), st)
+    assert len(calls) == 2, calls
+    assert moved[0]["last"] == first[0]["last"], (first, moved)
+    return "one process per session per pass, and a dropped reading is refreshed"
+
+
 def test_liveness_reads_one_small_record_not_the_transcript() -> str:
     tmp_env()
     st = state(("WO-401", "ses_a", 30),)
@@ -641,6 +703,7 @@ def test_liveness_reads_one_small_record_not_the_transcript() -> str:
     # and the shape the CLI really returns for a big session: truncated JSON, which
     # oc_api hands back as {"raw": ...} - it must mean "unknown", never "idle"
     watcher.oc_api = lambda *a, **k: {"raw": '{"data":[{"id":"msg_1","time":{"crea'}
+    watcher._MOVED_MEMO.clear()          # a fresh reading, not the one above
     act = REAL_SESSION_ACTIVITY(cfg(), st)
     assert act[0]["last"] is None and act[0]["live"] is False, act
     return "one small record per agent, so a 261 KB message page cannot blind us mid-way"
@@ -1155,6 +1218,7 @@ def main() -> int:
         ("a cap holds the third agent", test_slot_cap_holds_the_third),
         ("low memory holds instead", test_low_memory_holds_new_agents),
         ("a probe is not a starter", test_a_probe_never_starts_a_second_service),
+        ("a slow service is not a herd", test_a_timed_out_probe_is_not_a_starter),
         ("a replacement says who", test_a_replacement_says_who_did_it),
         ("a repeated line is said once", test_a_repeated_line_is_said_once),
         ("status names our views", test_status_shows_the_views_we_own),
@@ -1173,6 +1237,7 @@ def main() -> int:
         ("a restarted server is noticed", test_service_restart_is_noticed_across_a_watcher_restart),
         ("a dead server is started once", test_ensure_service_only_touches_a_dead_server),
         ("liveness comes from the record", test_activity_reads_the_record),
+        ("a record is read once per pass", test_a_record_is_read_once_per_pass),
         ("one small record, not the page", test_liveness_reads_one_small_record_not_the_transcript),
         ("the probe asks once, small", test_the_probe_asks_once_and_only_for_the_tail),
         ("an unreadable record is unknown", test_an_unreadable_record_is_never_idle),
