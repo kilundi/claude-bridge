@@ -927,6 +927,22 @@ def slot_agents(activity: list[dict], cfg: dict, now: float | None = None,
     return out
 
 
+def probe_targets(activity: list[dict]) -> list[dict]:
+    """The orders a pass must ask about: the ones still open.
+
+    A finished order holds no slot, waits on nobody and has already reported, so a verdict
+    about it decides nothing - yet the book keeps every session the loop ever started (79
+    on 11-16, 75 of them finished), and a pass asked about all of them: one ``opencode``
+    process per session per pass, every 30 s, ~2.5 spawns a second and ~216k in a day, on a
+    box already 2.5 GB into swap.  That herd is what leaves a service struggling, and a
+    client whose service is struggling is what starts a second server - which kills every
+    in-flight turn (see :func:`oc_api`).  An order that reports DONE in this very minute is
+    *not* in ``finished`` yet, so it is still asked: this runs before
+    :func:`finish_reported_orders`, which is what marks it.
+    """
+    return [a for a in activity if not a.get("finished")]
+
+
 def turn_probe(cfg: dict):
     """A ``probe`` for :func:`slot_agents`: what is this session's turn doing?"""
     binp = os.path.expanduser((cfg.get("watch") or {}).get("opencode_bin")
@@ -2177,11 +2193,13 @@ def pass_once(cfg: dict, st: dict, dry_run: bool = False) -> dict:
     tidy_marks(st)
     verdicts: dict[str, str] = {}
     if activity:
-        # One probe per session for the whole pass: the same reading decides the slot
-        # count, the "waiting for you" rows, and whether an agent has reported DONE.
-        # (The probe memo makes the later calls free.)
+        # One probe per *open* session for the whole pass: the same reading decides the slot
+        # count, the "waiting for you" rows, and whether an agent has reported DONE.  Only
+        # the open ones - the book's 75 finished sessions are asked about by nobody, which
+        # is what took this pass from 79 client processes to a handful (see
+        # :func:`probe_targets`).  (The probe memo makes the later calls free.)
         probe = turn_probe(cfg)
-        for a in activity:
+        for a in probe_targets(activity):
             v = probe(a)
             if v is not None:
                 verdicts[a["order"]] = v

@@ -753,6 +753,26 @@ def test_liveness_reads_one_small_record_not_the_transcript() -> str:
     return "one small record per agent, so a 261 KB message page cannot blind us mid-way"
 
 
+def test_a_finished_order_is_never_asked_about() -> str:
+    """The probe target list: the book keeps every session, only the open ones are asked.
+
+    75 of the 79 stored orders were finished and a pass still spent one ``opencode``
+    process on each of them, every 30 s - ~2.5 spawns a second, ~216k in a day, on a box
+    already 2.5 GB into swap.  A finished order holds no slot, waits on nobody and has
+    already reported, so a verdict about it decides nothing.
+    """
+    now = time.time()
+    activity = [{"order": "WO-FIN", "session": "ses_1", "last": now, "live": True,
+                 "finished": True},
+                {"order": "WO-OPEN", "session": "ses_2", "last": now, "live": True,
+                 "finished": False},
+                {"order": "WO-OLD", "session": "ses_3", "last": now - 7200, "live": False,
+                 "finished": False}]
+    assert [a["order"] for a in watcher.probe_targets(activity)] == ["WO-OPEN", "WO-OLD"], \
+        watcher.probe_targets(activity)
+    return "a finished order is never asked about, so the book's history costs nothing"
+
+
 def test_the_probe_asks_once_and_only_for_the_tail() -> str:
     """The probe is one 355-byte request per session, and never the whole page."""
     tmp_env()
@@ -1284,6 +1304,7 @@ def main() -> int:
         ("one process for the whole book", test_the_order_book_is_one_process_per_pass),
         ("a stale listing never costs liveness", test_a_stale_listing_never_costs_liveness),
         ("one small record, not the page", test_liveness_reads_one_small_record_not_the_transcript),
+        ("a finished order is never probed", test_a_finished_order_is_never_asked_about),
         ("the probe asks once, small", test_the_probe_asks_once_and_only_for_the_tail),
         ("an unreadable record is unknown", test_an_unreadable_record_is_never_idle),
         ("resume needs a restart", test_resume_only_after_a_restart),
