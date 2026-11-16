@@ -640,6 +640,60 @@ def _moved_at(binp: str, sid: str, ttl: float = MOVED_MEMO_TTL) -> float | None:
     return answer
 
 
+# A pass asks about *every* stored session - 79 of them in the order book on 11-16 - and
+# each reading used to cost its own `opencode` process: 79 client starters per pass, ~150 a
+# minute, 58,105 of them in one day, ~11 alive at any instant on a 7.8 GB box that was
+# already 2.5 GB into swap.  A client whose service is struggling is what starts a second
+# server, and a replaced server kills every in-flight turn - which is the same day's log
+# line, verbatim: "a 30 s read timed out, the next probe started a server, the live turns
+# died, every agent looked stuck" (see :func:`oc_api`, 39 pid changes of which 5 were ours).
+# The service hands out every session's own record in one listing, so one process per pass
+# can answer for the whole book and the herd stops existing.
+ACTIVITY_BATCH_TTL = 25.0
+_ACTIVITY_BATCH: dict = {}
+
+
+def _moved_map(binp: str, ttl: float = ACTIVITY_BATCH_TTL) -> dict[str, float | None]:
+    """Every session's ``time.updated``, from one call - the whole order book, one process.
+
+    Returns ``{}`` when the listing cannot be read (an older service without the endpoint, a
+    page the CLI truncated, a service that is down): the caller then reads one session at a
+    time, which is the old path and stays correct.  A listing that *did* answer also seeds
+    :data:`_MOVED_MEMO`, so the rest of the pass - the slot count, the resume, the status
+    views - asks the API for nothing at all.
+    """
+    hit = _ACTIVITY_BATCH.get("map")
+    if hit is not None and ttl and time.time() - float(_ACTIVITY_BATCH.get("at") or 0) < ttl:
+        return hit
+    try:
+        data = oc_api(binp, "GET", "/api/session?limit=500", timeout=30)
+    except Exception:
+        return {}                      # not remembered: the next pass may find it up again
+    data = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(data, list):
+        return {}
+    out: dict[str, float | None] = {}
+    for s in data:
+        if not isinstance(s, dict) or not s.get("id"):
+            continue
+        t = s.get("time") or {}
+        last: float | None = None
+        for key in ("updated", "created"):
+            v = t.get(key)
+            if isinstance(v, (int, float)):
+                last = v / 1000.0
+                break
+        out[str(s["id"])] = last
+    if not out:
+        return {}
+    stamp = time.time()
+    _ACTIVITY_BATCH["at"] = stamp
+    _ACTIVITY_BATCH["map"] = out
+    for sid, last in out.items():
+        _MOVED_MEMO[sid] = (stamp, last)
+    return out
+
+
 # A slot belongs to a running agent, and the only honest way to know is to look at the
 # session's transcript.  The answers are kept for a few seconds: one pass asks about the
 # same sessions more than once, and a hung API would charge its full timeout each time.
@@ -795,15 +849,22 @@ def session_activity(cfg: dict, st: dict, now: float | None = None) -> list[dict
     starts = st.get("starts") or {}
     done = st.get("finished") or {}
     out: list[dict] = []
+    # one process for the whole book, not one per session (see :func:`_moved_map`); a
+    # session the listing did not carry is still read on its own, so a stale listing can
+    # never turn a working agent into an idle one
+    batch = _moved_map(binp)
     for oid, sid in (st.get("sessions") or {}).items():
         last: float | None = None
-        try:
-            last = _moved_at(binp, sid)
-        except Exception as e:
-            # once per order per half hour, not once per order per pass: this line alone
-            # filled the log 312 times while the service was down
-            log_once("unreadable-%s" % oid,
-                     "  could not read %s's session record: %s" % (oid, e), every=1800)
+        if sid in batch:
+            last = batch[sid]
+        else:
+            try:
+                last = _moved_at(binp, sid)
+            except Exception as e:
+                # once per order per half hour, not once per order per pass: this line alone
+                # filled the log 312 times while the service was down
+                log_once("unreadable-%s" % oid,
+                         "  could not read %s's session record: %s" % (oid, e), every=1800)
         out.append({"order": oid, "session": sid, "last": last, "finished": oid in done,
                     "live": bool(last and now - last < window)})
     out.sort(key=lambda a: (starts.get(a["order"]) or {}).get("updated") or 0)

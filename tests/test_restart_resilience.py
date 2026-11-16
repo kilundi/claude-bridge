@@ -50,6 +50,8 @@ def tmp_env(tmp=None) -> str:
     # the record-read memo too: it is process-wide, so one proof's reading of a session
     # would otherwise answer the next proof's question about the same session id
     watcher._MOVED_MEMO.clear()
+    # and the one-call listing that now answers for the whole book
+    watcher._ACTIVITY_BATCH.clear()
     # the outbox too: a report finished from its file alone is queued for the planner, and a
     # test must never put anything in the real one
     bridge.OUTBOX = os.path.join(d, "outbox")
@@ -127,6 +129,12 @@ def stub_api(ages: dict):
         calls.append((method, path, payload))
         if method == "POST":
             return {"ok": True}
+        if path.startswith("/api/session?"):
+            # the listing: the whole book's own records, in one answer
+            return {"data": [{"id": sid, "outcome": "succeeded",
+                              "time": {"created": int((time.time() - age) * 1000) - 60000,
+                                       "updated": int((time.time() - age) * 1000)}}
+                             for sid, age in ages.items()]}
         parts = path.split("/")
         sid = parts[3] if len(parts) > 3 else ""
         age = ages.get(sid)
@@ -671,26 +679,60 @@ def test_activity_reads_the_record() -> str:
     return "liveness comes from the session's own timestamps, not its outcome field"
 
 
-def test_a_record_is_read_once_per_pass() -> str:
-    """One pass asks about a session several times; each ask used to be a whole process.
+def test_the_order_book_is_one_process_per_pass() -> str:
+    """The herd: a pass over N sessions used to cost N clients - one process per session.
 
-    The order book is 76 sessions and a pass reads each one for the slot count, the resume
-    and the status views.  Every read spawns an ``opencode`` client - the herd - so the
-    reading is kept for a few seconds, and a caller that needs a fresh one drops it.
+    On 11-16 the order book was 79 sessions, so every pass spawned 79 ``opencode``
+    processes (~150 a minute, 58,105 in a day, ~11 alive at any instant) on a box already
+    2.5 GB into swap.  A client whose service is struggling is what starts a second server,
+    and a replaced server kills every in-flight turn - the same day's log line, verbatim:
+    "a 30 s read timed out, the next probe started a server, the live turns died, every
+    agent looked stuck".  One listing answers for the whole book, so the herd stops.
     """
     tmp_env()
-    st = state(("WO-402", "ses_a", 30),)
-    watcher.oc_api, calls = stub_api({"ses_a": 30})
-    first = REAL_SESSION_ACTIVITY(cfg(), st)
-    again = REAL_SESSION_ACTIVITY(cfg(), st)      # the resume and the views ask too
-    assert len(calls) == 1, "the record is read once per session per pass: %d" % len(calls)
-    assert first[0]["last"] == again[0]["last"], (first, again)
-    # and a reading that has aged out is asked for again
+    st = state(*[("WO-%d" % (500 + i), "ses_%d" % i, 60) for i in range(40)])
+    watcher.oc_api, calls = stub_api({"ses_%d" % i: 60 for i in range(40)})
+    act = REAL_SESSION_ACTIVITY(cfg(), st)
+    assert len(act) == 40, len(act)
+    assert len(calls) == 1, "40 sessions must cost one process, not %d" % len(calls)
+    assert [c[1] for c in calls] == ["/api/session?limit=500"], calls
+    assert all(a["live"] and a["last"] for a in act), act
+    # the slot count, the resume and the status views all ask again inside the pass: still
+    # no more processes - they read the listing that is open
+    REAL_SESSION_ACTIVITY(cfg(), st)
+    assert len(calls) == 1, calls
+    # and a listing that has aged out is asked for once more
     watcher._MOVED_MEMO.clear()
-    moved = REAL_SESSION_ACTIVITY(cfg(), st)
+    watcher._ACTIVITY_BATCH.clear()
+    REAL_SESSION_ACTIVITY(cfg(), st)
     assert len(calls) == 2, calls
-    assert moved[0]["last"] == first[0]["last"], (first, moved)
-    return "one process per session per pass, and a dropped reading is refreshed"
+    return "79 sessions per pass cost one opencode process, not one per session (the herd)"
+
+
+def test_a_stale_listing_never_costs_liveness() -> str:
+    """A listing that does not carry a session must not read as "not live".
+
+    The listing is newest-first and capped, so an old session it does not mention is read
+    on its own - and a *live* one can never be missing, so a missing reading can never
+    free a slot a working agent is holding.
+    """
+    tmp_env()
+    st = state(("WO-410", "ses_old", 60))
+    calls: list = []
+
+    def fake(binp, method, path, payload=None, timeout=60):
+        calls.append(path)
+        if path.startswith("/api/session?"):
+            return {"data": [{"id": "ses_someone_else", "time": {"updated": 1_794_820_000_000}}]}
+        if path == "/api/session/ses_old":
+            return {"data": {"id": "ses_old", "time": {"updated": (time.time() - 60) * 1000}}}
+        raise RuntimeError(path)
+
+    watcher.oc_api = fake
+    act = REAL_SESSION_ACTIVITY(cfg(), st)
+    assert act[0]["live"] is True and act[0]["last"], act
+    assert calls == ["/api/session?limit=500", "/api/session/ses_old"], calls
+    return "a session the listing does not carry is read on its own, never called idle"
 
 
 def test_liveness_reads_one_small_record_not_the_transcript() -> str:
@@ -699,11 +741,13 @@ def test_liveness_reads_one_small_record_not_the_transcript() -> str:
     watcher.oc_api, calls = stub_api({"ses_a": 30})
     REAL_SESSION_ACTIVITY(cfg(), st)
     paths = [c[1] for c in calls]
-    assert paths == ["/api/session/ses_a"], paths
+    assert paths == ["/api/session?limit=500"], paths
+    assert not any("/message" in p for p in paths), paths
     # and the shape the CLI really returns for a big session: truncated JSON, which
     # oc_api hands back as {"raw": ...} - it must mean "unknown", never "idle"
     watcher.oc_api = lambda *a, **k: {"raw": '{"data":[{"id":"msg_1","time":{"crea'}
     watcher._MOVED_MEMO.clear()          # a fresh reading, not the one above
+    watcher._ACTIVITY_BATCH.clear()
     act = REAL_SESSION_ACTIVITY(cfg(), st)
     assert act[0]["last"] is None and act[0]["live"] is False, act
     return "one small record per agent, so a 261 KB message page cannot blind us mid-way"
@@ -1237,7 +1281,8 @@ def main() -> int:
         ("a restarted server is noticed", test_service_restart_is_noticed_across_a_watcher_restart),
         ("a dead server is started once", test_ensure_service_only_touches_a_dead_server),
         ("liveness comes from the record", test_activity_reads_the_record),
-        ("a record is read once per pass", test_a_record_is_read_once_per_pass),
+        ("one process for the whole book", test_the_order_book_is_one_process_per_pass),
+        ("a stale listing never costs liveness", test_a_stale_listing_never_costs_liveness),
         ("one small record, not the page", test_liveness_reads_one_small_record_not_the_transcript),
         ("the probe asks once, small", test_the_probe_asks_once_and_only_for_the_tail),
         ("an unreadable record is unknown", test_an_unreadable_record_is_never_idle),
