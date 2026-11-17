@@ -26,6 +26,8 @@ drafts/
 shots/
 reports/
 terminals/
+# one claim file per order, created by a dispatch and released by its report
+claims/
 
 __pycache__/
 *.pyc

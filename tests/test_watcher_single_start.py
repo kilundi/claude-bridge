@@ -88,7 +88,11 @@ def tmp_env() -> str:
     watcher.INBOX = os.path.join(d, "inbox")
     watcher.LOG = os.path.join(d, "watcher.log")
     watcher.LOCK = os.path.join(d, "watcher.lock")
+    # the parent half of these proofs dispatches through the real handle_orders, which
+    # claims each order (see watcher.claim_order) - never in the live home
+    watcher.CLAIMS = os.path.join(d, "claims")
     os.makedirs(watcher.INBOX, exist_ok=True)
+    os.makedirs(watcher.CLAIMS, exist_ok=True)
     # a test must never open a real terminal window on the user's desktop
     watcher.open_agent_terminal = lambda cfg_, oid, sid, directory: False
     # ... nor read a real agent transcript from the opencode server
@@ -124,6 +128,10 @@ def test_simultaneous_start() -> str:
         "CB_DIR": ROOT, "CB_STATE": watcher.STATE, "CB_INBOX": watcher.INBOX,
         "CB_LOG": watcher.LOG, "CB_LOCK": watcher.LOCK, "CB_STARTS": starts,
         "CB_ORDER": json.dumps(ORDER), "CB_GO": go, "CB_RELEASE": release,
+        # the worker imports the real module: give it the sandbox as its home, or every
+        # path it derives itself (reports/, claims/ - one claim per order, see
+        # watcher.claim_order) would be written in the live home
+        "CLAUDE_BRIDGE_HOME": d,
     })
     env.pop("WATCHER_LOCK_FD", None)
 

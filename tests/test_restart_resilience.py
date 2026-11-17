@@ -33,6 +33,9 @@ import watcher  # noqa: E402
 REAL_SESSION_ACTIVITY = watcher.session_activity
 REAL_TURN_VERDICT = watcher._turn_verdict
 REAL_AGENT_WINDOWS = watcher.agent_windows
+# and the pid reader, which a proof about the service stubs: a stub left behind made every
+# claim in a later proof look stale (its "starter" was read as dead), so it comes back here
+REAL_PID_ALIVE = watcher._pid_alive
 
 
 def tmp_env(tmp=None) -> str:
@@ -43,6 +46,9 @@ def tmp_env(tmp=None) -> str:
     watcher.DOWNLOADS = os.path.join(d, "downloads")
     watcher.NEEDS_ORDER = os.path.join(d, "NEEDS-ORDER.md")
     watcher.REPORTS = os.path.join(d, "reports")
+    # claims live beside the reports, and a proof must never claim a real order in the
+    # live home - that is the file another watcher would read
+    watcher.CLAIMS = os.path.join(d, "claims")
     # say-once bookkeeping and the down-service latch are process-wide: a proof must start
     # from neither, or the first proof's lines hide the second proof's
     watcher._SAID.clear()
@@ -57,6 +63,8 @@ def tmp_env(tmp=None) -> str:
     bridge.OUTBOX = os.path.join(d, "outbox")
     os.makedirs(watcher.INBOX, exist_ok=True)
     os.makedirs(watcher.DOWNLOADS, exist_ok=True)
+    os.makedirs(watcher.CLAIMS, exist_ok=True)
+    os.makedirs(watcher.REPORTS, exist_ok=True)
     # a test must never open, or close, a real window on the user's desktop, and must
     # never talk to the API: those stubs are the defaults, and each proof overrides
     # only the one it is about
@@ -66,6 +74,9 @@ def tmp_env(tmp=None) -> str:
     # a proof about the views stubs this; the real reader (tmux + /proc) comes back here, so
     # one proof's stub can never decide another proof's answer
     watcher.agent_windows = REAL_AGENT_WINDOWS
+    # the pid reader: one proof stubs it to "everything is dead", and a stub left behind
+    # would make a live claim look stale in every proof after it
+    watcher._pid_alive = REAL_PID_ALIVE
     # the transcript probe: "nobody could say", which must always hold a slot.  A proof
     # that is about it overrides this.
     watcher._turn_verdict = lambda binp, sid: None
@@ -753,6 +764,131 @@ def test_liveness_reads_one_small_record_not_the_transcript() -> str:
     return "one small record per agent, so a 261 KB message page cannot blind us mid-way"
 
 
+def _race(oid: str, n: int = 3, why: str = "race") -> list:
+    """n processes that all try to claim the same order at the same instant.
+
+    The children stay alive until every answer is in.  A child that exited would make the
+    claim it had just taken look stale - its pid is gone and it opened no window - and the
+    next child would take it over: a race in the proof, not in the claim.
+    """
+    import multiprocessing as mp
+    ctx = mp.get_context("fork")       # fork: the children inherit this module's paths
+    start = ctx.Barrier(n)
+    hold = ctx.Barrier(n + 1)
+    q = ctx.Queue()
+
+    def work():
+        start.wait()
+        ok, reason = watcher.claim_order(oid, why=why)
+        q.put((os.getpid(), ok, reason))
+        hold.wait(timeout=60)          # live until the parent has read every answer
+
+    procs = [ctx.Process(target=work) for _ in range(n)]
+    for p in procs:
+        p.start()
+    out = [q.get(timeout=30) for _ in range(n)]
+    hold.wait(timeout=60)
+    for p in procs:
+        p.join(timeout=30)
+    return out
+
+
+def test_two_dispatches_start_exactly_one_agent() -> str:
+    """Two dispatchers, one order id, exactly one agent - the order.
+
+    WO-236's context: one order was dispatched to two agents several times (WO-210, 211,
+    213, 215, 222, 225, 226, 228), and after an out-of-memory reboot both WO-224 and
+    WO-228 resumed on one worktree and corrupted a schema file.  A mark in state.json
+    cannot prevent it - it is saved *before* the slow API call - so the claim file, created
+    with O_EXCL before any agent is started, is what makes exactly one dispatcher win.
+    """
+    tmp_env()
+    watcher.agent_windows = lambda *a, **k: []          # no tmux in a proof
+    watcher.open_agent_terminal = lambda *a, **k: False
+    d = os.path.dirname(watcher.STATE)
+    started = os.path.join(d, "started.txt")
+
+    def fake_start(cfg_, o, files, inbox):
+        fd = os.open(started, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o644)
+        os.write(fd, ("%d\n" % os.getpid()).encode())
+        os.close(fd)
+        time.sleep(0.3)                  # a slow start, so the racers really do overlap
+        return "ses_fake"
+
+    watcher.start_agent = fake_start
+    st = {"orders": {}, "sessions": {},
+          "starts": {"WO-700": {"status": "pending", "attempts": 0, "order": order("WO-700"),
+                                "files": [], "inbox": os.path.join(d, "WO-700.md")}}}
+    watcher.save_state(st)
+    import multiprocessing as mp
+    ctx = mp.get_context("fork")
+    start = ctx.Barrier(3)
+    hold = ctx.Barrier(4)      # every child lives until the parent has counted the starts
+
+    def dispatch():
+        start.wait()           # all three enter the dispatch together
+        watcher.ensure_started(cfg(), st, "WO-700", delay=0)
+        hold.wait(timeout=60)  # a child that exited would make its own claim look stale
+
+    procs = [ctx.Process(target=dispatch) for _ in range(3)]
+    for p in procs:
+        p.start()
+    hold.wait(timeout=60)
+    for p in procs:
+        p.join(timeout=60)
+    lines = [l for l in open(started).read().split("\n") if l.strip()] \
+        if os.path.exists(started) else []
+    assert len(lines) == 1, "exactly one process may start it, got %r" % (lines,)
+    # and the claim says what was started, so the next pass can tell it from a dead one
+    claim = watcher.read_claim("WO-700")
+    assert claim and claim["state"] == "started" and claim["session"] == "ses_fake", claim
+    return "three simultaneous dispatches of one order id start exactly one agent"
+
+
+def test_a_stale_claim_is_replaced_exactly_once() -> str:
+    """A reboot: stale only when the claimed pid AND its window are both gone."""
+    tmp_env()
+    watcher.agent_windows = lambda *a, **k: []          # no window is open
+    dead = next(p for p in (4194303, 4194302, 999983, 999979) if not watcher._pid_alive(p))
+    with open(watcher.claim_path("WO-701"), "w") as fh:
+        json.dump({"oid": "WO-701", "state": "starting", "starter_pid": dead, "pid": 0,
+                   "window": "", "session": "", "started": time.time() - 3600}, fh)
+    out = _race("WO-701", n=3)
+    winners = [r for r in out if r[1]]
+    assert len(winners) == 1, "exactly one replacement, got %r" % (out,)
+    assert watcher.read_claim("WO-701") is not None
+    # a claim whose starter still runs is held by every process: never a second agent
+    with open(watcher.claim_path("WO-702"), "w") as fh:
+        json.dump({"oid": "WO-702", "state": "starting", "starter_pid": os.getpid(),
+                   "pid": 0, "window": "", "session": "", "started": time.time()}, fh)
+    out2 = _race("WO-702", n=3)
+    assert not [r for r in out2 if r[1]], "a live claim is never taken over: %r" % (out2,)
+    return "a stale claim is replaced by exactly one agent, a live one by none"
+
+
+def test_a_reported_order_is_ignored_and_its_claim_freed() -> str:
+    """The report file ends both the dispatch and the claim."""
+    tmp_env()
+    os.makedirs(watcher.REPORTS, exist_ok=True)
+    with open(watcher.report_file("WO-703"), "w") as fh:
+        fh.write("DONE\n")
+    got, _ = watcher.claim_order("WO-703", why="left over from before the report")
+    assert got and watcher.read_claim("WO-703") is not None
+    assert watcher.release_reported_claims() == ["WO-703"], "the claim is released"
+    assert watcher.read_claim("WO-703") is None
+    st = {"orders": {}, "sessions": {},
+          "starts": {"WO-703": {"status": "pending", "attempts": 0, "order": order("WO-703"),
+                                "files": [], "inbox": os.path.join(
+                                    os.path.dirname(watcher.STATE), "WO-703.md")}}}
+    starts: list = []
+    watcher.start_agent = lambda *a, **k: (starts.append(1) or "ses_x")
+    watcher.handle_orders(cfg(), st, [order("WO-703")], files=[])
+    assert starts == [], "an order with a report is not dispatched: %r" % (starts,)
+    assert "already on disk" in open(watcher.LOG).read(), open(watcher.LOG).read()
+    assert watcher.read_claim("WO-703") is None, "and no claim is left behind"
+    return "an order with a report on disk is ignored, and its claim is released"
+
+
 def test_a_finished_order_is_never_asked_about() -> str:
     """The probe target list: the book keeps every session, only the open ones are asked.
 
@@ -1305,6 +1441,9 @@ def main() -> int:
         ("a stale listing never costs liveness", test_a_stale_listing_never_costs_liveness),
         ("one small record, not the page", test_liveness_reads_one_small_record_not_the_transcript),
         ("a finished order is never probed", test_a_finished_order_is_never_asked_about),
+        ("one order, one agent", test_two_dispatches_start_exactly_one_agent),
+        ("a stale claim is replaced once", test_a_stale_claim_is_replaced_exactly_once),
+        ("a report ends the claim", test_a_reported_order_is_ignored_and_its_claim_freed),
         ("the probe asks once, small", test_the_probe_asks_once_and_only_for_the_tail),
         ("an unreadable record is unknown", test_an_unreadable_record_is_never_idle),
         ("resume needs a restart", test_resume_only_after_a_restart),

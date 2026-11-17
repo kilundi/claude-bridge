@@ -65,7 +65,11 @@ def tmp_env() -> str:
     watcher.DOWNLOADS = os.path.join(d, "downloads")
     watcher.REPORTS = os.path.join(d, "reports")
     watcher.NEEDS_ORDER = os.path.join(d, "NEEDS-ORDER.md")
+    # the claim one dispatch puts on an order (see watcher.claim_order): a proof must
+    # never write it in the live home, where the real watcher would read it
+    watcher.CLAIMS = os.path.join(d, "claims")
     os.makedirs(watcher.INBOX, exist_ok=True)
+    os.makedirs(watcher.CLAIMS, exist_ok=True)
     os.makedirs(watcher.DOWNLOADS, exist_ok=True)
     # a test must never open a real terminal window on the user's desktop
     watcher.open_agent_terminal = lambda cfg_, oid, sid, directory: False

@@ -17,6 +17,7 @@ A single pass is available for cron/systemd timers:  python3 watcher.py --once
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import hashlib
 import json
@@ -56,6 +57,9 @@ DOWNLOADS = os.path.join(HOME, "downloads")
 REPORTS = os.path.join(HOME, "reports")
 # written when a turn is stalled and Claude did not answer the one automatic ask
 NEEDS_ORDER = os.path.join(HOME, "NEEDS-ORDER.md")
+# one claim file per order id: created with O_EXCL before any agent is started, so exactly
+# one process can ever be starting that order (see claim_order)
+CLAIMS = os.path.join(HOME, "claims")
 # where the opencode background server registers itself (pid, url, password)
 SERVICE_JSON = os.path.expanduser("~/.local/state/opencode/service.json")
 
@@ -1150,6 +1154,225 @@ def memory_holds(cfg: dict, st: dict, orders: list[dict]) -> bool:
     return True
 
 
+# --- one claim per order: the same order must never start two agents ------------------
+# The loop has dispatched one order to two agents several times (WO-210, 211, 213, 215,
+# 222, 225, 226, 228), and after an out-of-memory reboot wiped /tmp it resumed both
+# WO-224 and WO-228 on one worktree, which corrupted a schema file.  A mark in state.json
+# cannot prevent that on its own: a start is saved *before* the slow API call, so two
+# processes - a restart, a second watcher, a resume racing a dispatch - both read "not
+# started" and both start.  The claim file is created with ``O_EXCL`` *before* any agent is
+# started, and the kernel lets exactly one creator win; it ends when the order's report
+# file exists, or when the operator deletes it.
+def claim_path(oid: str) -> str:
+    """One file per order id, in a directory of their own beside the reports."""
+    return os.path.join(CLAIMS, "%s.lock" % window_name(oid))
+
+
+def read_claim(oid: str) -> dict | None:
+    """The claim on this order, or ``None`` when there is none.
+
+    A file that exists but cannot be read reads as ``{}`` - "a claim exists and I cannot
+    say what it holds" - and is always held, never replaced (see :func:`claim_is_stale`).
+    """
+    try:
+        with open(claim_path(oid)) as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _claim_window_alive(name: str) -> bool:
+    """Is the claimed window still open?  A window we cannot check is not a dead one."""
+    if not name:
+        return False
+    try:
+        for w in agent_windows():
+            target = str(w.get("tmux") or "")
+            if target == name or target.endswith(":" + name) or target.endswith("/" + name):
+                return True
+    except Exception:
+        return True
+    return False
+
+
+def claim_is_stale(claim: dict) -> tuple[bool, str]:
+    """Stale only when what the claim recorded is gone - never on a claim we cannot read.
+
+    The claim is written *before* the agent exists, so for those seconds it records the
+    starter.  A start still in flight is not stale; one whose starter died mid-start is,
+    because nothing was ever recorded to protect - and a reboot replaces it with exactly
+    one agent.  A claim we cannot read is always held, because starting a second agent for
+    one order is the failure this exists to prevent.
+    """
+    if not claim.get("state"):
+        return False, "the claim file cannot be read - holding it (delete it to release)"
+    pid = int(claim.get("pid") or 0)
+    window = str(claim.get("window") or "")
+    if str(claim.get("state")) == "starting":
+        starter = int(claim.get("starter_pid") or 0)
+        if starter and _pid_alive(starter):
+            return False, "a start by pid %d is still in flight" % starter
+        return True, ("the start by pid %s died mid-start: pid %s and window %s are both "
+                      "gone" % (starter or "-", pid or "-", window or "-"))
+    if pid and _pid_alive(pid):
+        return False, "its agent pid %d is alive" % pid
+    if window and _claim_window_alive(window):
+        return False, "its window %s is still open" % window
+    if not pid and not window:
+        return False, "it recorded no pid and no window - holding it"
+    return True, "pid %s and window %s are both gone" % (pid or "-", window or "-")
+
+
+@contextlib.contextmanager
+def _claim_section(timeout: float = 10.0):
+    """The one place a claim decision is made, so two cannot make it at once.
+
+    A proof of WO-236 caught the first version of this: a takeover that renamed the file
+    it had judged stale could rename a *fresh* claim that a racer created in the gap
+    between the read and the rename, and then both of them held a claim - two agents, the
+    exact failure the claim exists to prevent.  ``O_EXCL`` alone cannot close that gap,
+    because a takeover is a read, a removal and a create, and the kernel only makes the
+    create atomic.  So the whole decision runs under one mutex, and the mutex is a
+    ``mkdir``: the kernel makes that atomic too.  The section is microseconds long; a
+    holder that died inside it must not wedge claims forever, so one older than the
+    stale window is broken.
+    """
+    path = os.path.join(CLAIMS, ".section")   # a directory, so it is never read as a claim
+    deadline = time.time() + timeout
+    locked = False
+    while not locked:
+        try:
+            os.mkdir(path)
+            locked = True
+        except FileExistsError:
+            try:
+                if time.time() - os.stat(path).st_mtime > 10.0:
+                    os.rmdir(path)
+                    continue
+            except Exception:
+                pass
+            if time.time() > deadline:
+                break
+            time.sleep(0.02)
+        except Exception:
+            break                    # no section: refuse the claim, never race for it
+    try:
+        yield locked
+    finally:
+        if locked:
+            try:
+                os.rmdir(path)
+            except Exception:
+                pass
+
+
+def claim_order(oid: str, why: str = "dispatching") -> tuple[bool, str]:
+    """Try to become the one process allowed to start this order's agent.
+
+    The create is ``O_EXCL``, so of any number of racing processes exactly one gets
+    ``True`` - that is the whole point.  The read, the removal of a stale claim and the
+    create all happen inside :func:`_claim_section`, so a reboot replaces a claim with
+    exactly one agent and never two sessions for the same id.  A process that already
+    holds the claim keeps it, which is what lets one start be retried
+    (:func:`ensure_started`) without a second process sneaking in.
+    """
+    path = claim_path(oid)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except Exception:
+        pass
+    with _claim_section() as locked:
+        if not locked:
+            return False, "the claims section is busy - trying again next pass"
+        existing = read_claim(oid)
+        if existing is not None:
+            if int(existing.get("starter_pid") or 0) == os.getpid():
+                return True, "this process already holds the claim"
+            stale, reason = claim_is_stale(existing)
+            if not stale:
+                return False, "already claimed: %s" % reason
+            try:
+                os.unlink(path)      # the stale record, and only it: nobody else is
+            except FileNotFoundError:  # inside this section to have replaced it
+                pass
+            except Exception as e:
+                return False, "could not clear the stale claim: %s" % e
+            log("  %s's claim was stale (%s) - this pass replaces it" % (oid, reason))
+        body = {"oid": oid, "state": "starting", "starter_pid": os.getpid(), "pid": 0,
+                "window": "", "session": "", "started": time.time(), "why": why}
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            return False, "another process claimed it first"
+        except Exception as e:
+            # never start without a claim: two agents on one worktree is what this prevents
+            return False, "could not write a claim: %s" % e
+        with os.fdopen(fd, "w") as fh:
+            json.dump(body, fh)
+        return True, "claimed"
+
+
+def update_claim(oid: str, **fields) -> None:
+    """Record what the claim now stands for: the agent's pid, its window, its session."""
+    claim = read_claim(oid)
+    if claim is None:
+        return
+    claim.update(fields)
+    claim["updated"] = time.time()
+    tmp = claim_path(oid) + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(claim, fh)
+        os.replace(tmp, claim_path(oid))
+    except Exception:
+        pass
+
+
+def release_claim(oid: str, why: str) -> bool:
+    """Drop the claim, so a later dispatch may start an agent for this order again."""
+    try:
+        os.unlink(claim_path(oid))
+    except Exception:
+        return False
+    log("  released %s's claim (%s)" % (oid, why))
+    return True
+
+
+def release_reported_claims() -> list[str]:
+    """A claim ends when its order's report file exists - the rule, run every pass.
+
+    The report stays on disk for the person to read; an operator deleting a claim file is
+    the other way to release one, and needs nothing from us.
+    """
+    out: list[str] = []
+    try:
+        names = sorted(os.listdir(CLAIMS))
+    except Exception:
+        return out
+    for name in names:
+        if not name.endswith(".lock"):
+            continue
+        oid = str((read_claim(name[:-len(".lock")]) or {}).get("oid") or name[:-len(".lock")])
+        if os.path.exists(report_file(oid)):
+            if release_claim(oid, "reports/%s.md exists" % oid):
+                out.append(oid)
+    return out
+
+
+def _agent_pid(sid: str) -> int:
+    """The pid of the agent's own view, when we can see it - what makes a claim stale."""
+    try:
+        for w in agent_windows():
+            if str(w.get("sid") or "") == sid and int(w.get("pid") or 0):
+                return int(w["pid"])
+    except Exception:
+        pass
+    return 0
+
+
 def dispatch_batch(cfg: dict, st: dict, orders: list[dict], dry_run: bool = False,
                    activity: list[dict] | None = None) -> tuple[list[dict], list[dict]]:
     """How many of these orders may start now, and which have to wait for a slot.
@@ -2052,6 +2275,20 @@ def ensure_started(cfg: dict, st: dict, oid: str, delay: float | None = None) ->
         return sessions.get(oid) or rec.get("session")
     if rec.get("status") in ("started", "dry_run", "skipped"):
         return None
+    # an order whose report is already on disk is done, not dispatched (rule 4): the file
+    # is the completion signal, so starting an agent for it would be work thrown away
+    if os.path.exists(report_file(oid)):
+        log("  not starting an agent for %s: reports/%s.md is already on disk" % (oid, oid))
+        rec["status"] = "reported"
+        rec["updated"] = time.time()
+        save_state(st)
+        return None
+    # one process per order, enforced before any API call: the claim is the only thing that
+    # survives a restart, a second watcher, or a resume racing a dispatch (see claim_order)
+    got, why = claim_order(oid, why="starting")
+    if not got:
+        log("  not starting an agent for %s: %s" % (oid, why))
+        return None
 
     watch = cfg.get("watch", {})
     max_retries = int(watch.get("start_retries", START_MAX_RETRIES))
@@ -2082,6 +2319,10 @@ def ensure_started(cfg: dict, st: dict, oid: str, delay: float | None = None) ->
                 % (oid, attempts, max_retries + 1, e))
             if attempts > max_retries:
                 log("  giving up on %s after %d attempt(s) - status failed" % (oid, attempts))
+                # nothing was ever started, so the claim protects nothing: a claim that
+                # outlived a failed start would block the order's next dispatch forever
+                release_claim(oid, "the start failed %d time(s) - no agent was started"
+                              % attempts)
                 return None
             time.sleep(delay)
             continue
@@ -2098,6 +2339,10 @@ def ensure_started(cfg: dict, st: dict, oid: str, delay: float | None = None) ->
         else:
             log("  started opencode session %s in %s" % (sid, where))
         open_agent_terminal(cfg, oid, sid, where)
+        # the claim now stands for this agent: its own pid when we can see it, the
+        # starter's otherwise - so the claim is never read as stale while the agent works
+        update_claim(oid, pid=_agent_pid(sid) or os.getpid(), window=window_name(oid),
+                     session=sid, state="started")
         return sid
     return None
 
@@ -2146,6 +2391,11 @@ def handle_orders(cfg: dict, st: dict, orders: list[dict], files: list[dict] | N
             # may ever start an agent on half a brief
             log("  refusing %s - not dispatchable (missing %s)" % (o["id"], ", ".join(problems)))
             continue
+        # rule 4: completion is the report file, so an order that already has one is done -
+        # dispatching it again would spend an agent on finished work
+        if os.path.exists(report_file(o["id"])):
+            log("  ignoring %s - reports/%s.md is already on disk" % (o["id"], o["id"]))
+            continue
         inbox_path = order_to_inbox(o, files)
         log("new work order %s -> %s" % (o["id"], inbox_path))
         seen[o["id"]] = _hash(o["raw"])
@@ -2191,6 +2441,8 @@ def pass_once(cfg: dict, st: dict, dry_run: bool = False) -> dict:
             % (restarted.get("from"), restarted.get("to"), why))
     activity = [] if dry_run else session_activity(cfg, st)
     tidy_marks(st)
+    if not dry_run:
+        release_reported_claims()   # a report on disk ends its order's claim (claim_order)
     verdicts: dict[str, str] = {}
     if activity:
         # One probe per *open* session for the whole pass: the same reading decides the slot

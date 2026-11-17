@@ -85,6 +85,10 @@ def tmp_env() -> str:
     watcher.INBOX = os.path.join(d, "inbox")
     watcher.REPORTS = os.path.join(d, "reports")
     watcher.LOG = os.path.join(d, "watcher.log")
+    # the claim one dispatch puts on an order (see watcher.claim_order): a proof must
+    # never write it in the live home, where the real watcher would read it
+    watcher.CLAIMS = os.path.join(d, "claims")
+    os.makedirs(watcher.CLAIMS, exist_ok=True)
     os.makedirs(watcher.REPORTS, exist_ok=True)
     os.makedirs(watcher.INBOX, exist_ok=True)
     return d
