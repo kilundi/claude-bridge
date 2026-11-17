@@ -2347,16 +2347,26 @@ def ensure_started(cfg: dict, st: dict, oid: str, delay: float | None = None) ->
     return None
 
 
-def reconcile_starts(cfg: dict, st: dict, dry_run: bool = False, delay: float | None = None) -> None:
+def reconcile_starts(cfg: dict, st: dict, dry_run: bool = False, delay: float | None = None,
+                     activity: list[dict] | None = None) -> None:
     """Recover orders that were marked seen but never got a session.
 
     This is the retry path for a process killed between the mark and the start:
     the normal "new order" path will not fire again (the mark is already saved),
     so we try to start it once here - bounded by the attempt limit in
-    ``ensure_started``, which records every failure.
+    ``ensure_started``, which records every failure - and by the same slot cap the
+    new-order path obeys.  A retry is one more agent, so it waits for a slot exactly
+    like a new order does: ``max_agents: 1`` has to mean one, whoever is asking.
     """
     if dry_run or not cfg.get("watch", {}).get("auto_start", True):
         return
+    cap = int((cfg.get("watch") or {}).get("max_agents") or 0)
+    working = 0
+    if cap > 0:
+        act = activity if activity is not None else session_activity(cfg, st)
+        working = len(slot_agents(act, cfg, probe=turn_probe(cfg)))
+        if working >= cap:
+            return
     max_retries = int(cfg.get("watch", {}).get("start_retries", START_MAX_RETRIES))
     for oid in list((st.get("starts") or {}).keys()):
         rec = (st.get("starts") or {}).get(oid) or {}
@@ -2365,6 +2375,11 @@ def reconcile_starts(cfg: dict, st: dict, dry_run: bool = False, delay: float | 
         if int(rec.get("attempts") or 0) > max_retries:
             continue  # terminal failure - never loop, and keep the log quiet
         if rec.get("status") in ("pending", "failed", "starting"):
+            if cap > 0 and working >= cap:
+                log("  holding %s: %d of %d agents are already working (max_agents), so its "
+                    "retry waits for a slot" % (oid, working, cap))
+                continue
+            working += 1        # a start we just asked for is one more agent
             ensure_started(cfg, st, oid, delay=delay)
 
 
@@ -2417,7 +2432,7 @@ def handle_orders(cfg: dict, st: dict, orders: list[dict], files: list[dict] | N
         else:
             rec["status"] = "pending"
 
-    reconcile_starts(cfg, st, dry_run=dry_run, delay=retry_delay)
+    reconcile_starts(cfg, st, dry_run=dry_run, delay=retry_delay, activity=activity)
     return st
 
 

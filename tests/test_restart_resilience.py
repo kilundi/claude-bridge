@@ -793,6 +793,30 @@ def _race(oid: str, n: int = 3, why: str = "race") -> list:
     return out
 
 
+def test_a_retry_needs_a_free_slot_too() -> str:
+    """max_agents 1: a retry is an agent too, so it waits like a new order does.
+
+    The retry path (an order whose start never happened) used to ignore the cap, so
+    one agent could be working and a second would still be started behind it.
+    """
+    tmp_env()
+    st = {"orders": {}, "sessions": {"WO-409": "ses_work"},
+          "starts": {"WO-410": {"status": "failed", "attempts": 0, "order": order("WO-410")},
+                     "WO-411": {"status": "failed", "attempts": 0, "order": order("WO-411")}}}
+    started: list[str] = []
+    watcher.start_agent = lambda c, o, f, i: (started.append(o["id"]) or "ses_new")
+    one = cfg(max_agents=1, start_retries=2)
+    # one agent is in a turn: neither retry may start
+    watcher.reconcile_starts(one, st, activity=make_activity({"WO-409": 5})(None, st))
+    assert started == [], "one agent is already working, so no retry may start: %r" % (started,)
+    # the slot is free: exactly one of them goes, and the second is held for a later pass
+    watcher.reconcile_starts(one, st, activity=[])
+    assert started == ["WO-410"], "one slot means one retry at a time: %r" % (started,)
+    log = open(watcher.LOG).read()
+    assert "holding WO-411" in log and "1 of 1 agents" in log, log
+    return "with one slot a retry waits for it, then starts exactly one and holds the rest"
+
+
 def test_two_dispatches_start_exactly_one_agent() -> str:
     """Two dispatchers, one order id, exactly one agent - the order.
 
@@ -1442,6 +1466,7 @@ def main() -> int:
         ("one small record, not the page", test_liveness_reads_one_small_record_not_the_transcript),
         ("a finished order is never probed", test_a_finished_order_is_never_asked_about),
         ("one order, one agent", test_two_dispatches_start_exactly_one_agent),
+        ("a retry needs a free slot", test_a_retry_needs_a_free_slot_too),
         ("a stale claim is replaced once", test_a_stale_claim_is_replaced_exactly_once),
         ("a report ends the claim", test_a_reported_order_is_ignored_and_its_claim_freed),
         ("the probe asks once, small", test_the_probe_asks_once_and_only_for_the_tail),
