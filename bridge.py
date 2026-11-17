@@ -763,6 +763,35 @@ JS_LAST_MESSAGES = (
 """
 )
 
+JS_TRANSCRIPT = r"""
+(async () => {
+  const cid = (location.pathname.split('/').pop() || '');
+  if (!cid) return JSON.stringify({ok: false, why: 'the page is not on a conversation'});
+  const get = (url) => fetch(url, {headers: {'accept': 'application/json'}});
+  const conv = async (org) => {
+    const r = await get(`/api/organizations/${org}/chat_conversations/${cid}`);
+    return r.ok ? await r.json() : null;
+  };
+  let j = window.__bridgeOrg ? await conv(window.__bridgeOrg) : null;
+  if (!j) {
+    window.__bridgeOrg = '';
+    const r = await get('/api/organizations');
+    const orgs = r.ok ? await r.json() : [];
+    for (const o of (orgs || [])) {
+      const id = o.uuid || o.id;
+      if (!id) continue;
+      j = await conv(id);
+      if (j) { window.__bridgeOrg = id; break; }
+    }
+  }
+  if (!j) return JSON.stringify({ok: false, why: 'no organisation would answer for this chat'});
+  const all = (j.chat_messages || []).filter(m => m.sender === 'assistant' && (m.text || '').trim());
+  const n = __N__;
+  return JSON.stringify({ok: true, total: (j.chat_messages || []).length, assistant: all.length,
+                         msgs: all.slice(-n).map(m => m.text)});
+})()
+"""
+
 JS_LIMIT_FN = r"""
   const bridgeInTranscript = el => !!(el.closest && el.closest('[data-testid="transcript-row"], [data-testid="assistant-message"]'));
   const bridgeLimit = (() => {
@@ -1323,6 +1352,31 @@ class Bridge:
             if (out and (out[-1] or "").strip()) or time.time() >= deadline:
                 return [m for m in out if (m or "").strip()]
             time.sleep(0.6)
+
+    def transcript(self, c: CDP, n: int = 20, timeout: float = 90.0) -> list[str]:
+        """The last ``n`` assistant messages, from claude.ai's own transcript.
+
+        The screen is what ``last_messages`` reads, and the page renders only a handful of
+        messages at a time: an order that has scrolled out of that window is invisible
+        while it is still in the chat, which is how a work order gets lost.  This asks the
+        page for the conversation itself instead, which has every message in it.
+
+        The conversation response is megabytes, so the page keeps only the last ``n``
+        texts and hands those back.  Anything unreadable comes back as ``[]`` and the
+        caller stays with the screen.
+        """
+        try:
+            res = c.js(JS_TRANSCRIPT.replace("__N__", str(max(1, int(n)))),
+                       timeout=timeout, await_promise=True)
+        except Exception:
+            return []
+        try:
+            d = json.loads(res or "{}")
+        except Exception:
+            return []
+        if not d.get("ok"):
+            return []
+        return [m for m in (d.get("msgs") or []) if (m or "").strip()]
 
     def probe(self, c: CDP) -> dict:
         return json.loads(c.js(JS_PROBE))

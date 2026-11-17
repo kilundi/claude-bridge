@@ -5,6 +5,7 @@
     "auto_start": true,
     "auto_launch_bridge": false,
     "lookback": 3,
+    "transcript_lookback": 20,
     "compact_on_resume": true,
     "launch_terminal": true,
     "default_dir": "~/projects",

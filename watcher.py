@@ -13,6 +13,11 @@ other way round:
 
 Run it in the background with ./watcher.sh start (see ./watcher.sh status).
 A single pass is available for cron/systemd timers:  python3 watcher.py --once
+
+Orders are read from the chat's own transcript as well as from the screen.  The page
+renders only the last handful of messages, so an order that has scrolled out of that
+window is invisible while it is still in the chat; ``widen_read`` reads the transcript
+whenever a new message has arrived, and keeps that read as an order source.
 """
 from __future__ import annotations
 
@@ -2383,6 +2388,67 @@ def reconcile_starts(cfg: dict, st: dict, dry_run: bool = False, delay: float | 
             ensure_started(cfg, st, oid, delay=delay)
 
 
+def widen_read(b: Bridge, c, cfg: dict, st: dict, msgs: list[str],
+               dry_run: bool = False) -> tuple[list[str], str]:
+    """Read the chat's own transcript whenever a new message has arrived.
+
+    The page renders only the last handful of messages at a time, so an order that has
+    scrolled out of that window is invisible to the watcher while it is still in the chat.
+    That is how a work order gets lost: WO-238 sat one message above the rendered window
+    with three "another copy of the report" replies below it, the watcher read its three
+    and never saw the order - and widening ``lookback`` cannot help, because lookback only
+    reaches further into the same handful of messages the page has actually rendered.
+
+    So the order source is the screen **plus** the last transcript read, and the transcript
+    is read again whenever the newest message on the screen is not the one that read ended
+    with.  That is one megabyte fetch per new message, not per pass, and it means an order
+    is read even after its own message has scrolled away - including one written while the
+    bridge window was down, because that message leaves the newest-message check changed.
+
+    A kept read is what holds a waiting order alive: ``prune_marks`` drops a held order the
+    read no longer carries, and the read carries the last ``transcript_lookback`` messages,
+    not the three the screen renders.
+
+    An unreadable transcript is not fatal: the screen alone is what the watcher had before,
+    it is retried when a new message arrives, and a transcript that just failed is not
+    hammered on every pass.  Returns ``(msgs, note)``, ``note`` being the line to log.
+    """
+    if dry_run:
+        return msgs, ""
+    watch = cfg.get("watch") or {}
+    seen = st.get("chat_read") or {}
+    newest = hashlib.sha1(((msgs[-1] if msgs else "") or "").strip().encode()).hexdigest()[:16]
+    changed = bool(newest) and seen.get("newest") != newest
+    if not changed:
+        return _with_cached(seen, msgs), ""
+    if seen.get("failed") == newest and seen.get("failed_at", 0) > time.time() - 600:
+        # it broke for this very message less than ten minutes ago: do not fetch it again
+        return _with_cached(seen, msgs), ""
+    n = int(watch.get("transcript_lookback") or max(int(watch.get("lookback") or 3), 20))
+    try:
+        wider = b.transcript(c, n)
+    except Exception as e:
+        wider, note = [], "the chat's transcript raised (%s)" % e
+    else:
+        note = ""
+    if wider:
+        st["chat_read"] = {"at": time.time(), "newest": newest, "messages": len(wider),
+                           "msgs": wider[-n:]}
+        return _with_cached(st["chat_read"], msgs), \
+            ("read %d message(s) from the chat's own transcript, not just the %d the screen "
+             "renders" % (len(wider), len(msgs)))
+    st["chat_read"] = {"failed": newest, "failed_at": time.time(),
+                       "messages": seen.get("messages", 0), "msgs": seen.get("msgs") or []}
+    return _with_cached(st["chat_read"], msgs), \
+        (note + " - staying with the %d message(s) the screen shows" % len(msgs))
+
+
+def _with_cached(seen: dict, msgs: list[str]) -> list[str]:
+    """The screen's messages plus the ones the last transcript read carried."""
+    cached = [m for m in (seen.get("msgs") or []) if (m or "").strip()]
+    return cached + [m for m in msgs if m not in cached]
+
+
 def handle_orders(cfg: dict, st: dict, orders: list[dict], files: list[dict] | None = None,
                   dry_run: bool = False, retry_delay: float | None = None,
                   activity: list[dict] | None = None) -> dict:
@@ -2536,6 +2602,9 @@ def pass_once(cfg: dict, st: dict, dry_run: bool = False) -> dict:
             log("outbox flush skipped: %s" % e)
         lookback = int(cfg.get("watch", {}).get("lookback", 3))
         msgs = b.last_messages(c, lookback)
+        msgs, wider = widen_read(b, c, cfg, st, msgs)
+        if wider:
+            log_once("chat-wider", wider, every=900)
     finally:
         c.close()
     if not msgs:
