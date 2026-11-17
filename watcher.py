@@ -2511,9 +2511,12 @@ def pass_once(cfg: dict, st: dict, dry_run: bool = False) -> dict:
         try:
             if outbox_files():
                 res = b.flush_outbox(timeout=float(cfg.get("watch", {}).get("flush_timeout", 300)))
-                log("outbox: delivered %d queued report(s)%s"
+                log("outbox: delivered %d queued report(s)%s%s"
                     % (len(res["sent"]),
-                       (", %d still waiting" % len(res["remaining"])) if res["remaining"] else ""))
+                       (", %d still waiting" % len(res["remaining"])) if res["remaining"] else "",
+                       # why it is waiting, when it is waiting: a composer holding
+                       # somebody's own draft is the usual reason, and it is theirs to clear
+                       (" - %s" % res["stopped"]) if res.get("stopped") and not res["sent"] else ""))
         except Exception as e:
             log("outbox flush skipped: %s" % e)
         lookback = int(cfg.get("watch", {}).get("lookback", 3))

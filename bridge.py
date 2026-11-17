@@ -189,7 +189,19 @@ def queue_message(text: str, reason: str = "") -> str:
 
     Written to ~/claude-bridge/outbox/ newest-last; ``flush_outbox`` sends them
     once the bridge (or the plan) is back, oldest first.
+
+    A message that is already queued is never queued a second time: a refused send
+    re-queues the text it was handed, and on 2026-11-18 a composer holding somebody's
+    own draft turned that into one copy per pass - 132 copies of WO-235's report, each
+    of which would have gone to the planner in turn ("another copy of the WO-235 report"
+    three times over).  The copy already waiting *is* the delivery, so it is returned
+    instead.  Two different reports never have the same body, so nothing is lost.
     """
+    body = (text or "").strip()
+    if body:
+        for path in outbox_files():
+            if read_queued(path) == body:
+                return path
     os.makedirs(OUTBOX, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     slug = re.sub(r"[^a-z0-9]+", "-", (text or "").strip().lower()[:40]).strip("-") or "report"
@@ -1744,6 +1756,14 @@ class Bridge:
                 continue
             try:
                 self.ask(body, timeout=timeout)
+            except ComposerBlocked as e:
+                # The box holds somebody's own words or screenshot, which the bridge will
+                # not post along with our message, so this one cannot go out yet.  It is
+                # still queued - *the same single copy*, because a refused send no longer
+                # queues a second one (see queue_message) - so stop here, say why, and
+                # try again on a later pass instead of looping into the queue.
+                stopped = str(e)
+                break
             except ClaudeUnavailable as e:
                 stopped = str(e)
                 if e.sent:
