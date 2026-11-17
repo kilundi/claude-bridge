@@ -183,6 +183,30 @@ def test_slot_cap_holds_the_third() -> str:
     return "2/2 slots full: the third order waits, unmarked, and is named in the log"
 
 
+def test_one_order_at_a_time() -> str:
+    """max_agents 1: two new orders in one pass - one starts, the other waits its turn.
+
+    This is the setting the live home runs with: one task at a time, so a second order
+    can never be started behind the first.  The second is held *unmarked*, which is what
+    makes the next pass pick it up the moment the slot frees.
+    """
+    tmp_env()
+    st: dict = {"orders": {}, "starts": {}, "sessions": {}}
+    started: list[str] = []
+    watcher.start_agent = lambda c, o, f, i: (started.append(o["id"]) or "ses_new")
+    st = watcher.handle_orders(cfg(max_agents=1), st,
+                               [order("WO-420"), order("WO-421")], files=[])
+    assert started == ["WO-420"], "one slot means one start: %r" % (started,)
+    assert "WO-420" in st["orders"] and "WO-421" not in st["orders"], st["orders"]
+    assert st["held"].get("WO-421"), "the second order waits, unmarked: %r" % (st.get("held"),)
+    assert "holding WO-421" in open(watcher.LOG).read(), open(watcher.LOG).read()
+    # and when the slot frees, the waiting order goes - once
+    st["finished"] = {"WO-420": time.time()}
+    watcher.handle_orders(cfg(max_agents=1), st, [order("WO-421")], files=[])
+    assert started == ["WO-420", "WO-421"], started
+    return "one slot: the second order waits unmarked, then starts when the slot frees"
+
+
 def test_low_memory_holds_new_agents() -> str:
     """11-11: 246 MiB free, the background server died, every in-flight turn with it.
 
@@ -1440,6 +1464,7 @@ def test_status_says_what_is_running() -> str:
 def main() -> int:
     checks = [
         ("a cap holds the third agent", test_slot_cap_holds_the_third),
+        ("one order at a time", test_one_order_at_a_time),
         ("low memory holds instead", test_low_memory_holds_new_agents),
         ("a probe is not a starter", test_a_probe_never_starts_a_second_service),
         ("a slow service is not a herd", test_a_timed_out_probe_is_not_a_starter),
