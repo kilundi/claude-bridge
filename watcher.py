@@ -507,6 +507,75 @@ def ledger_clear(st: dict, oid: str) -> bool:
     return False
 
 
+# The one-time seed that closes the gap between the ledger going live and the reports that
+# are already on disk (WO-254).  `ledger_seeded` is the marker that limits it to the first
+# pass - and lives in the state file, so a restart does not seed a second time.
+LEDGER_SEEDED_KEY = "ledger_seeded"
+
+
+def report_ids() -> list[str]:
+    """Every report on disk, as an order id (``reports/WO-123.md`` -> ``WO-123``)."""
+    try:
+        names = sorted(os.listdir(REPORTS))
+    except Exception:
+        return []
+    return [n[:-len(".md")] for n in names if n.endswith(".md") and n[:-len(".md")]]
+
+
+def seed_ledger_from_reports(st: dict) -> list[str]:
+    """Give every report already on disk a ledger entry, so it cannot be dispatched again.
+
+    The ledger only records ids that report or fail *after* it is applied, and the older
+    report-on-disk rule ignores a report older than :data:`SELF_DONE_MAX_AGE` (24 h).  So
+    without this seed every order finished before the ledger existed becomes re-dispatchable
+    a day later, the moment its block is posted again - today's WO-236, WO-238 and WO-249
+    among them.  One pass at start turns each ``reports/<id>.md`` into a ledger entry:
+    ``failed`` when its first line is :data:`FAILURE_MARKER`, ``reported`` otherwise.
+
+    It is deliberately timid: an existing entry is never overwritten, an id that still
+    holds a *live* claim (an agent is on it) is left alone, and no report file is touched or
+    moved.  Returns the ids it seeded; running it again adds nothing.
+    """
+    seeded: list[str] = []
+    for oid in report_ids():
+        if ledger_has(st, oid):
+            continue                       # already known: never overwrite
+        claim = read_claim(oid)
+        if claim is not None and not claim_is_stale(claim)[0]:
+            continue                       # a live claim: an agent may still be working
+        status = "reported"
+        try:
+            with open(report_file(oid), encoding="utf-8", errors="replace") as fh:
+                first = (fh.readline() or "").strip()
+        except Exception:
+            first = ""
+        if first.startswith(FAILURE_MARKER):
+            status = "failed"
+        ledger_add(st, oid, status, "seeded from reports/%s.md at start" % oid)
+        seeded.append(oid)
+    return seeded
+
+
+def seed_ledger_once(st: dict, dry_run: bool = False) -> list[str]:
+    """Run :func:`seed_ledger_from_reports` on the first pass only, then remember it.
+
+    The marker is in the state file, so a restart does not seed a second time, and - just as
+    important - a ``requeue`` that clears an entry can never be undone by a later pass
+    re-seeding it from the same report file.  Logs one line with the count either way.
+    """
+    if st.get(LEDGER_SEEDED_KEY):
+        return []
+    seeded = seed_ledger_from_reports(st)
+    st[LEDGER_SEEDED_KEY] = time.time()
+    if not dry_run:
+        save_state(st)
+    log("ledger seed ran for the first time: %d report(s) already on disk were added to the "
+        "ledger%s" % (len(seeded),
+                      (" (%s%s" % (", ".join(seeded[:8]), "..." if len(seeded) > 8 else "")) +
+                       ")" if seeded else ""))
+    return seeded
+
+
 def route_orders(st: dict, orders: list[dict]) -> dict:
     """Split extracted orders into what the watcher should do with each.
 
@@ -2407,25 +2476,31 @@ def requeue_order(st: dict, oid: str) -> bool:
     ``ensure_started`` hand the dead id back instead of starting a fresh agent), clears
     the seen mark so a repeated block is dispatchable again, and deletes a failure report
     this watcher wrote (only that one: a real DONE report is the person's to keep).
+    A seeded id (WO-254) has a ledger entry but no start record; that is the one case with
+    nothing to reset but the ledger, and it takes the same cleanup.  Returns ``True`` when
+    there was something to reset.
     """
     rec = (st.get("starts") or {}).get(oid)
     had_ledger = ledger_clear(st, oid)
-    if not rec:
-        if had_ledger:
-            save_state(st)
-        return had_ledger
+    if not rec and not had_ledger:
+        return False
     (st.get("finished") or {}).pop(oid, None)
     (st.get("held") or {}).pop(oid, None)
     (st.get("waiting") or {}).pop(oid, None)
     st.setdefault("sessions", {})[oid] = ""      # merge-safe: a popped key would come back
-    # "" rather than a pop: save_state unions the record's keys too, so a removed `session`
-    # would come back on the next save (the same trap as `first_attempt_at` below)
-    rec["session"] = ""
     # the seen mark is set to "" rather than popped: save_state unions *with* the file, and
     # a key we removed would come back on the next save (see the first_attempt_at note below)
     if isinstance(st.get("orders"), dict):
         st["orders"][oid] = ""
     _clear_failure_report(oid)
+    if not rec:
+        # seeded id: clearing the ledger entry is the whole reset (nothing was ever started)
+        save_state(st)
+        release_claim(oid, "re-queued by hand")
+        return True
+    # "" rather than a pop: save_state unions the record's keys too, so a removed `session`
+    # would come back on the next save (the same trap as `first_attempt_at` below)
+    rec["session"] = ""
     rec["status"] = "pending"
     rec["attempts"] = 0
     rec["last_error"] = None
@@ -2913,6 +2988,11 @@ def pass_once(cfg: dict, st: dict, dry_run: bool = False) -> dict:
     tidy_marks(st)
     if not dry_run:
         release_reported_claims()   # a report on disk ends its order's claim (claim_order)
+        # WO-254: the ledger only records what finishes after it goes live, so every report
+        # already on disk is seeded into it once here.  Without the seed an order finished
+        # before the ledger (WO-236/238/249 among them) became re-dispatchable as soon as its
+        # report aged past SELF_DONE_MAX_AGE and its block was posted again.
+        seed_ledger_once(st)
     verdicts: dict[str, str] = {}
     if activity:
         # One probe per *open* session for the whole pass: the same reading decides the slot
