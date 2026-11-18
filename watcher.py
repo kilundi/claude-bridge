@@ -1242,6 +1242,14 @@ def claim_is_stale(claim: dict) -> tuple[bool, str]:
         starter = int(claim.get("starter_pid") or 0)
         if starter and _pid_alive(starter):
             return False, "a start by pid %d is still in flight" % starter
+        # The starter died mid-start, but the start may still have taken: start_agent opens
+        # the window before the claim is updated, so if the window the claim named is still
+        # open an agent exists, and replacing the claim would start a second one for this id
+        # - the exact corruption this file exists to prevent.  Rule 3: stale only when the
+        # recorded pid AND the window are both gone.
+        if window and _claim_window_alive(window):
+            return False, "the start by pid %s died, but its window %s is still open" % (
+                starter or "-", window)
         return True, ("the start by pid %s died mid-start: pid %s and window %s are both "
                       "gone" % (starter or "-", pid or "-", window or "-"))
     if pid and _pid_alive(pid):
@@ -1329,7 +1337,7 @@ def claim_order(oid: str, why: str = "dispatching") -> tuple[bool, str]:
                 return False, "could not clear the stale claim: %s" % e
             log("  %s's claim was stale (%s) - this pass replaces it" % (oid, reason))
         body = {"oid": oid, "state": "starting", "starter_pid": os.getpid(), "pid": 0,
-                "window": "", "session": "", "started": time.time(), "why": why}
+                "window": window_name(oid), "session": "", "started": time.time(), "why": why}
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         except FileExistsError:
