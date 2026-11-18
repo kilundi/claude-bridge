@@ -68,10 +68,32 @@ CLAIMS = os.path.join(HOME, "claims")
 # where the opencode background server registers itself (pid, url, password)
 SERVICE_JSON = os.path.expanduser("~/.local/state/opencode/service.json")
 
-# how many times start_agent may be retried after the first failure, and how
-# long to wait between attempts (overridable from config.json watch settings)
+# How a failed agent start is retried.  A start fails while the opencode background
+# service is down (``oc_api`` raises before it even tries), when a pinned session is
+# gone, or when the working directory is missing.  Retrying it is what keeps a short
+# outage from losing an order - but a *long* wait must not freeze the loop, so the
+# delay grows (the slip's example: 5s, 30s, 2m, 5m, 10m - about fifteen minutes in
+# all), and any wait longer than ``START_RETRY_INLINE_MAX`` is left for a later pass
+# instead of being slept through in this one.  ``START_RETRY_BUDGET`` is the wall
+# clock after which a still-failing order is marked ``failed`` for good.
+START_RETRY_DELAYS = (5.0, 30.0, 120.0, 300.0, 600.0)
+START_RETRY_BUDGET = 900.0
+START_RETRY_INLINE_MAX = 30.0
+# kept so an older config.json - which speaks in a fixed retry *count* and a fixed
+# *delay* - still configures something sensible (see _retry_delays)
 START_MAX_RETRIES = 2
 START_RETRY_DELAY = 5.0
+
+
+def _now() -> float:
+    """The clock the retry schedule reads.  A proof replaces it to skip the waits."""
+    return time.time()
+
+
+def _sleep(seconds: float) -> None:
+    """The pause between two in-pass attempts.  A proof replaces it to skip it."""
+    if seconds > 0:
+        time.sleep(seconds)
 
 # Free memory (MemAvailable, MB) an order needs before its agent may start.  On by
 # default, because the failure it prevents is not a slow loop but a dead one: the
@@ -2129,6 +2151,34 @@ def finish_order(st: dict, oid: str) -> None:
     save_state(st)
 
 
+def requeue_order(st: dict, oid: str) -> bool:
+    """Put a failed order back in the queue so the next pass tries to start it again.
+
+    A failed start is otherwise terminal - the schedule is spent and the loop never
+    retries it - so this is the explicit command that re-queues it.  It clears the spent
+    ``attempts``, the ``last_error``, the retry clock and the finish mark, and drops any
+    claim a failed start may have left behind (nothing was started, so it protects
+    nothing).  Returns ``True`` when there was a start record to reset.
+    """
+    rec = (st.get("starts") or {}).get(oid)
+    if not rec:
+        return False
+    (st.get("finished") or {}).pop(oid, None)
+    (st.get("held") or {}).pop(oid, None)
+    (st.get("waiting") or {}).pop(oid, None)
+    rec["status"] = "pending"
+    rec["attempts"] = 0
+    rec["last_error"] = None
+    rec["next_attempt_at"] = 0
+    # save_state *unions* with the file, so a key we pop would survive there: clearing the
+    # budget clock means writing 0, not removing it (the next pass starts the clock afresh)
+    rec["first_attempt_at"] = 0
+    rec["updated"] = time.time()
+    save_state(st)
+    release_claim(oid, "re-queued by hand")
+    return True
+
+
 def tidy_marks(st: dict) -> list[str]:
     """Drop the marks a *finished* order must not carry: resume, waiting, held.
 
@@ -2262,13 +2312,60 @@ def download_new_files(b: Bridge, st: dict) -> list[dict]:
     return files
 
 
+def _retry_delays(watch: dict, delay: float | None = None) -> list[float]:
+    """The increasing waits between start attempts.
+
+    ``watch.start_retry_delays`` is the schedule itself; an older config that speaks in
+    ``start_retries`` (a count) and ``start_retry_delay`` (one fixed delay) is honoured by
+    repeating that delay; and an explicit ``delay`` argument overrides both, which is what a
+    caller that wants one fixed wait - and the proofs - pass.
+    """
+    if delay is not None:
+        n = int(watch.get("start_retries", len(START_RETRY_DELAYS)))
+        return [float(delay)] * max(0, n)
+    configured = watch.get("start_retry_delays")
+    if isinstance(configured, (list, tuple)) and configured:
+        return [float(d) for d in configured]
+    if "start_retries" in watch or "start_retry_delay" in watch:
+        n = int(watch.get("start_retries", START_MAX_RETRIES))
+        d = float(watch.get("start_retry_delay", START_RETRY_DELAY))
+        return [d] * max(0, n)
+    return list(START_RETRY_DELAYS)
+
+
+def _past_budget(rec: dict, now: float, budget: float) -> bool:
+    """True once the first attempt is older than the retry budget (never loops forever)."""
+    first = float(rec.get("first_attempt_at") or 0)
+    return bool(first) and budget > 0 and (now - first) >= budget
+
+
+def _give_up(oid: str, st: dict, rec: dict, attempts: int) -> None:
+    """Mark a start exhausted: failed for good, and its claim released.
+
+    Nothing was ever started for this order, so the claim protects nothing - a claim that
+    outlived a failed start would block the order's next dispatch forever.  The order is
+    re-queued by hand with ``watcher.py --requeue <id>`` (or ``watcher.sh requeue``).
+    """
+    if rec.get("status") != "failed":
+        log("  giving up on %s after %d attempt(s) - status failed" % (oid, attempts))
+    rec["status"] = "failed"
+    rec["next_attempt_at"] = 0
+    rec["updated"] = _now()
+    save_state(st)
+    release_claim(oid, "the start failed %d time(s) - no agent was started" % attempts)
+
+
 def ensure_started(cfg: dict, st: dict, oid: str, delay: float | None = None) -> str | None:
-    """Start the agent for one order, at most once, with a bounded retry path.
+    """Start the agent for one order, at most once, with a backed-off retry.
 
     * never starts a second session for an order that already has a session id in
       state (or in the ``starts`` record)
-    * on failure records ``status="failed"``, ``attempts`` and ``last_error`` and
-      retries at most ``start_retries`` more times, then gives up - it never loops
+    * a failed start is retried on an increasing schedule (5s, 30s, 2m, 5m, 10m - about
+      fifteen minutes in all, see :data:`START_RETRY_DELAYS`), recording ``attempts`` and
+      ``last_error``; a wait longer than ``START_RETRY_INLINE_MAX`` is left for a later
+      pass rather than slept through here, so a long outage never freezes the loop
+    * after the schedule (or the ``START_RETRY_BUDGET`` wall clock) is spent the order is
+      ``failed`` for good - it never loops, and ``--requeue`` puts it back
     """
     starts = st.setdefault("starts", {})
     rec = starts.get(oid)
@@ -2296,46 +2393,61 @@ def ensure_started(cfg: dict, st: dict, oid: str, delay: float | None = None) ->
         return None
 
     watch = cfg.get("watch", {})
-    max_retries = int(watch.get("start_retries", START_MAX_RETRIES))
-    if delay is None:
-        delay = float(watch.get("start_retry_delay", START_RETRY_DELAY))
+    delays = _retry_delays(watch, delay)
+    budget = float(watch.get("start_retry_budget_seconds", START_RETRY_BUDGET))
+    inline_max = float(watch.get("start_retry_inline_max", START_RETRY_INLINE_MAX))
     attempts = int(rec.get("attempts") or 0)
-    if attempts > max_retries:
-        log("  %s already failed to start %d time(s) - not retrying" % (oid, attempts))
+    now = _now()
+    # a retry that is scheduled for later is not due yet: leave it, the pass is not late
+    if now < float(rec.get("next_attempt_at") or 0):
+        return None
+    # the schedule is already spent (a previous pass marked it so, or the budget is gone):
+    # terminal - mark it once, quietly, and never loop
+    if attempts > len(delays) or _past_budget(rec, now, budget):
+        _give_up(oid, st, rec, attempts)
         return None
 
     order = rec.get("order") or {}
     files = rec.get("files") or []
     inbox_path = rec.get("inbox") or ""
-    while attempts <= max_retries:
+    while attempts <= len(delays):
         attempts += 1
         rec["attempts"] = attempts
         rec["status"] = "starting"
-        rec["updated"] = time.time()
+        rec.setdefault("first_attempt_at", now)
+        rec["updated"] = _now()
         save_state(st)
         try:
             sid = start_agent(cfg, order, files, inbox_path)
         except Exception as e:
-            rec["status"] = "failed"
+            now = _now()
             rec["last_error"] = str(e)
-            rec["updated"] = time.time()
+            rec["updated"] = now
             save_state(st)
             log("  could not start an agent for %s (attempt %d/%d): %s"
-                % (oid, attempts, max_retries + 1, e))
-            if attempts > max_retries:
-                log("  giving up on %s after %d attempt(s) - status failed" % (oid, attempts))
-                # nothing was ever started, so the claim protects nothing: a claim that
-                # outlived a failed start would block the order's next dispatch forever
-                release_claim(oid, "the start failed %d time(s) - no agent was started"
-                              % attempts)
+                % (oid, attempts, len(delays) + 1, e))
+            if attempts > len(delays) or _past_budget(rec, now, budget):
+                _give_up(oid, st, rec, attempts)
                 return None
-            time.sleep(delay)
+            wait = delays[attempts - 1]
+            # "retrying" is what a failed last attempt looks like while a retry is still
+            # scheduled: next_attempt_at is when it is allowed to try again.  "failed" is
+            # reserved for a spent schedule (see _give_up).
+            rec["status"] = "retrying"
+            rec["next_attempt_at"] = now + wait
+            save_state(st)
+            if wait > inline_max:
+                log("  will retry %s in %ds (attempt %d of %d)"
+                    % (oid, int(wait), attempts + 1, len(delays) + 1))
+                return None
+            _sleep(wait)
             continue
         sessions[oid] = sid
         rec["status"] = "started"
         rec["session"] = sid
         rec["last_error"] = None
-        rec["updated"] = time.time()
+        rec["next_attempt_at"] = 0
+        rec["updated"] = _now()
         save_state(st)
         where = order.get("dir") or watch.get("default_dir") or "~"
         if (order.get("session") or "").strip():
@@ -2356,12 +2468,13 @@ def reconcile_starts(cfg: dict, st: dict, dry_run: bool = False, delay: float | 
                      activity: list[dict] | None = None) -> None:
     """Recover orders that were marked seen but never got a session.
 
-    This is the retry path for a process killed between the mark and the start:
-    the normal "new order" path will not fire again (the mark is already saved),
-    so we try to start it once here - bounded by the attempt limit in
-    ``ensure_started``, which records every failure - and by the same slot cap the
-    new-order path obeys.  A retry is one more agent, so it waits for a slot exactly
-    like a new order does: ``max_agents: 1`` has to mean one, whoever is asking.
+    This is the retry path for a process killed between the mark and the start, and for an
+    order whose agent start failed while the service was down: the normal "new order" path
+    will not fire again (the mark is already saved), so we try to start it once here -
+    bounded by the attempt schedule in ``ensure_started``, which records every failure, and
+    by the same slot cap the new-order path obeys.  A retry is one more agent, so it waits
+    for a slot exactly like a new order does: ``max_agents: 1`` has to mean one, whoever is
+    asking.
     """
     if dry_run or not cfg.get("watch", {}).get("auto_start", True):
         return
@@ -2372,14 +2485,16 @@ def reconcile_starts(cfg: dict, st: dict, dry_run: bool = False, delay: float | 
         working = len(slot_agents(act, cfg, probe=turn_probe(cfg)))
         if working >= cap:
             return
-    max_retries = int(cfg.get("watch", {}).get("start_retries", START_MAX_RETRIES))
+    delays = _retry_delays(cfg.get("watch", {}) or {}, delay)
     for oid in list((st.get("starts") or {}).keys()):
         rec = (st.get("starts") or {}).get(oid) or {}
         if (st.get("sessions") or {}).get(oid) or rec.get("session"):
             continue
-        if int(rec.get("attempts") or 0) > max_retries:
+        if int(rec.get("attempts") or 0) > len(delays):
             continue  # terminal failure - never loop, and keep the log quiet
-        if rec.get("status") in ("pending", "failed", "starting"):
+        if rec.get("status") in ("pending", "retrying", "failed", "starting"):
+            if _now() < float(rec.get("next_attempt_at") or 0):
+                continue  # waiting out the backoff - retried only when it is due
             if cap > 0 and working >= cap:
                 log("  holding %s: %d of %d agents are already working (max_agents), so its "
                     "retry waits for a slot" % (oid, working, cap))
@@ -2787,18 +2902,28 @@ def main() -> int:
                     help="close the windows of agents that are not working, then exit")
     ap.add_argument("--finish", metavar="ORDER", default=None,
                     help="mark an order finished (frees its slot, stops any resume), then exit")
+    ap.add_argument("--requeue", metavar="ORDER", default=None,
+                    help="put a failed order back in the queue so the next pass retries it, then exit")
     ap.add_argument("--prune-state", action="store_true",
                     help="drop the start records of orders finished more than "
                          "watch.state_keep_days (7) days ago, then exit")
     args = ap.parse_args()
     cfg = load_config()
 
-    # These three only read state and merge their change back, so they are safe to run
+    # These commands only read state and merge their change back, so they are safe to run
     # beside a live watcher - which is exactly when you want them.
     if args.finish:
         finish_order(load_state(), args.finish)
         print("marked %s finished - its slot is free, and 'watcher.sh reap' will close "
               "its window" % args.finish)
+        return 0
+    if args.requeue:
+        if requeue_order(load_state(), args.requeue):
+            print("re-queued %s - its spent retries and finish mark are cleared, so the next "
+                  "pass will try to start it again" % args.requeue)
+        else:
+            print("no start record for %s - nothing to re-queue (was it ever seen?)"
+                  % args.requeue)
         return 0
     if args.reap:
         closed = reap_windows(cfg, load_state(), force=True)

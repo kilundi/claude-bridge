@@ -5,6 +5,7 @@
 #   ./watcher.sh prune-state        drop the start records of orders finished over a week ago
 #   ./watcher.sh unit               which systemd user unit supervises this home
 #   ./watcher.sh done WO-111        it reported DONE: free its agent slot now
+#   ./watcher.sh requeue WO-111     a start failed for good: put it back in the queue
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # The *code* is here; the pid, the lock and the logs live in the *home*.  A second pipeline
@@ -105,6 +106,12 @@ case "$CMD" in
     if [ -z "${2:-}" ]; then echo "usage: $0 done <WORK-ORDER-ID>"; exit 2; fi
     python3 "$HERE/watcher.py" --finish "$2"
     ;;
+  requeue)
+    # A failed start is terminal: this clears its spent retries so the next pass tries
+    # again.  Safe beside the watcher - it only reads state and merges its change back.
+    if [ -z "${2:-}" ]; then echo "usage: $0 requeue <WORK-ORDER-ID>"; exit 2; fi
+    python3 "$HERE/watcher.py" --requeue "$2"
+    ;;
   log)
     tail -n 40 -f "$HERE/watcher.log"
     ;;
@@ -113,5 +120,5 @@ case "$CMD" in
     echo "$UNIT"
     ;;
   *)
-    echo "usage: $0 {start|stop|restart|status|log|reap|run|prune-state|unit|done <WORK-ORDER-ID>}"; exit 2;;
+    echo "usage: $0 {start|stop|restart|status|log|reap|run|prune-state|unit|done <WORK-ORDER-ID>|requeue <WORK-ORDER-ID>}"; exit 2;;
 esac
