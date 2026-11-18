@@ -84,6 +84,16 @@ START_RETRY_INLINE_MAX = 30.0
 START_MAX_RETRIES = 2
 START_RETRY_DELAY = 5.0
 
+# The silent-death guard (see detect_silent_deaths).  When an order's claim says an agent
+# was started, and that agent's recorded pid AND its window are both gone, and no report
+# file exists, the session ended without a report - and today that is silent: the claim
+# just sits there and nobody hears about the order.  Wait ``silent_death_grace_seconds``
+# first, in case the report is being written right now, then leave exactly one failure
+# report and release the claim.  Configurable with ``watch.silent_death_grace_seconds``.
+SILENT_DEATH_GRACE = 90.0
+# the first line of the one file a silent death leaves, so it is recognisable later
+FAILURE_MARKER = "FAILURE: session ended without a report"
+
 
 def _now() -> float:
     """The clock the retry schedule reads.  A proof replaces it to skip the waits."""
@@ -199,6 +209,15 @@ def save_state(st: dict) -> None:
     # those: `watcher.sh done WO-116` popped the marker and the next save put it back, so
     # a finished order kept showing as waiting for a slot.
     merged["held"] = dict(st.get("held") or {})
+    # `ledger` and `deaths` carry meaning in their *absences* too - requeue clears a ledger
+    # entry and a report appearing clears a death timer - so when the caller holds the map
+    # (a full state, which every caller here does) it is authoritative, and a union with the
+    # file cannot resurrect what was just cleared.  `finished`, `sessions`, `resume` and
+    # `waiting` deliberately stay union-merged: a stale writer's save must never drop another
+    # process's marks for a live order (see test_a_finished_order_keeps_no_marks_at_all).
+    for key in ("ledger", "deaths"):
+        if key in st:
+            merged[key] = dict(st.get(key) or {})
     # And no *finished* order may keep a resume or waiting mark, whatever a stale copy still
     # says: merge puts one back every save otherwise, which is how WO-109 and WO-111-WO-114
     # went on reading as "resumed 3 time(s) - have a look at it" for days after they were
@@ -451,6 +470,43 @@ def resolve_order_files(order: dict, files: list[dict],
 SELF_DONE_MAX_AGE = 24 * 3600
 
 
+# --- the reported/failed ledger --------------------------------------------------------
+# The watcher remembers every order id that ever reached "reported" or "failed".  Without
+# it a repeated block for an id that has already run looked like new work and started a
+# second agent: on 2026-11-18 WO-236, WO-238 and WO-249 were each re-dispatched that way.
+# The ledger lives in state.json, so it survives a restart or a reboot, and the explicit
+# requeue command is the one thing that clears an entry (see requeue_order).
+LEDGER_KEY = "ledger"
+LEDGER_STATES = ("reported", "failed")
+
+
+def ledger_has(st: dict, oid: str) -> bool:
+    """Has this order id ever reached a terminal state here?"""
+    return oid in (st.get(LEDGER_KEY) or {})
+
+
+def ledger_get(st: dict, oid: str) -> dict:
+    """The ledger entry for an order, or ``{}`` when it is not in the ledger."""
+    ent = (st.get(LEDGER_KEY) or {}).get(oid)
+    return ent if isinstance(ent, dict) else {}
+
+
+def ledger_add(st: dict, oid: str, status: str, why: str = "") -> None:
+    """Remember that this id reached a terminal state, so a block cannot re-run it."""
+    if status not in LEDGER_STATES:
+        return
+    st.setdefault(LEDGER_KEY, {})[oid] = {"status": status, "at": time.time(), "why": why}
+
+
+def ledger_clear(st: dict, oid: str) -> bool:
+    """Forget an id: the explicit requeue is the only caller, and the only way back in."""
+    led = st.get(LEDGER_KEY)
+    if isinstance(led, dict) and oid in led:
+        led.pop(oid, None)
+        return True
+    return False
+
+
 def route_orders(st: dict, orders: list[dict]) -> dict:
     """Split extracted orders into what the watcher should do with each.
 
@@ -460,9 +516,11 @@ def route_orders(st: dict, orders: list[dict]) -> dict:
     * ignored    - byte-identical re-post of something already handled
     * reported   - never started here, but its report file is already on disk: its own
                    agent took the order out of the planner's chat and worked it
+    * ledger     - an id that already reached reported or failed: a repeat of its block is
+                   logged and dropped, and only ``requeue`` puts it back in play
     """
     out: dict[str, list] = {"dispatch": [], "incomplete": [], "duplicate": [],
-                            "ignored": [], "reported": []}
+                            "ignored": [], "reported": [], "ledger": []}
     seen = st.get("orders") or {}
     sessions = st.get("sessions") or {}
     starts = st.get("starts") or {}
@@ -472,6 +530,13 @@ def route_orders(st: dict, orders: list[dict]) -> dict:
     for o in orders:
         if seen.get(o["id"]) == _hash(o["raw"]):
             out["ignored"].append(o)
+            continue
+        if ledger_has(st, o["id"]):
+            # a re-post of an id that already reported or failed: logged and dropped, never
+            # a second agent (WO-236, WO-238 and WO-249 were re-dispatched this way on
+            # 2026-11-18).  Checked after the byte-identical case so an exact re-post still
+            # reads as "ignored"; only `requeue` clears the entry.
+            out["ledger"].append(o)
             continue
         problems = order_problems(o)
         if problems:
@@ -885,6 +950,8 @@ def session_activity(cfg: dict, st: dict, now: float | None = None) -> list[dict
     # never turn a working agent into an idle one
     batch = _moved_map(binp)
     for oid, sid in (st.get("sessions") or {}).items():
+        if not sid:
+            continue      # a re-queued order's session is cleared to "": not a session at all
         last: float | None = None
         if sid in batch:
             last = batch[sid]
@@ -1397,6 +1464,141 @@ def release_reported_claims() -> list[str]:
     return out
 
 
+def agent_log_tail(oid: str, lines: int = 20) -> list[str]:
+    """The last ``lines`` of the log this order's agent left behind.
+
+    The watcher keeps exactly one log - ``<home>/watcher.log`` (:data:`LOG`) - and has no
+    separate per-agent file, so the closest thing to one is its own lines about this order:
+    the last ``lines`` that mention the order id or its window name.  When none mention it
+    the tail of the whole file is used, because some evidence beats none.
+    """
+    try:
+        with open(LOG, encoding="utf-8", errors="replace") as fh:
+            rows = fh.read().splitlines()
+    except Exception:
+        return []
+    name = window_name(oid)
+    hits = [r for r in rows if oid in r or name in r]
+    return (hits or rows)[-lines:]
+
+
+def detect_silent_deaths(cfg: dict, st: dict, now: float | None = None,
+                         dry_run: bool = False) -> list[str]:
+    """Turn an order whose agent died with no report into exactly one failure report.
+
+    The condition is the claim's own: the id has a claim that says an agent was started,
+    the recorded pid AND the window are both gone (:func:`claim_is_stale`), and no
+    ``reports/<id>.md`` exists - a session that ended without a report.  Today that is
+    silent: the claim just sits there and nobody hears about the order (two orders died
+    that way on 2026-11-18, with no report and no branch).
+
+    It is not acted on at once.  The agent may be in the middle of writing its report, so
+    ``watch.silent_death_grace_seconds`` (default 90, :data:`SILENT_DEATH_GRACE`) is waited
+    out first, and a report that appears inside the grace wins - no failure is written.
+    After the grace the watcher writes ``reports/<id>.md`` (first line
+    :data:`FAILURE_MARKER`), sends it through the ordinary report path
+    (:func:`queue_report`) so the planner sees it, marks the order failed in the ledger and
+    releases the claim.  The order is **never restarted here**; ``requeue`` is the human's
+    call.  Returns the orders a failure report was written for this pass.
+    """
+    now = now or time.time()
+    grace = float((cfg.get("watch") or {}).get("silent_death_grace_seconds", SILENT_DEATH_GRACE))
+    done = st.get("finished") or {}
+    deaths = st.setdefault("deaths", {})
+    written: list[str] = []
+    try:
+        names = sorted(os.listdir(CLAIMS))
+    except Exception:
+        names = []
+    for name in names:
+        if not name.endswith(".lock"):
+            continue
+        try:
+            with open(os.path.join(CLAIMS, name)) as fh:
+                claim = json.load(fh)
+        except Exception:
+            continue
+        if not isinstance(claim, dict) or not claim.get("state"):
+            continue                     # unreadable: never call a claim we cannot read dead
+        oid = str(claim.get("oid") or name[:-len(".lock")])
+        if os.path.exists(report_file(oid)):
+            deaths.pop(oid, None)        # a report is on disk: not a silent death
+            continue
+        if oid in done:
+            deaths.pop(oid, None)        # already accounted for (e.g. a transcript report)
+            continue
+        if str(claim.get("state")) == "starting":
+            deaths.pop(oid, None)        # a start still in flight, not an agent that died
+            continue
+        stale, why = claim_is_stale(claim)
+        if not stale:
+            deaths.pop(oid, None)        # its pid or its window is back: no death
+            continue
+        rec = deaths.get(oid)
+        if not rec:
+            deaths[oid] = {"first_seen": now, "why": why}
+            save_state(st)
+            log("  %s's session ended without a report (%s) - waiting %ds in case it is "
+                "still writing one" % (oid, why, int(grace)))
+            continue
+        if now - float(rec.get("first_seen") or now) < grace:
+            continue                     # still inside the grace period
+        if dry_run:
+            continue
+        _write_failure_report(st, oid, claim, float(rec["first_seen"]), now, grace)
+        deaths.pop(oid, None)
+        written.append(oid)
+    return written
+
+
+def _write_failure_report(st: dict, oid: str, claim: dict, first_seen: float,
+                          now: float, grace: float) -> str:
+    """Write the one file a silent death leaves, forward it, then release the claim."""
+    tail = agent_log_tail(oid, 20)
+    started = float(claim.get("started") or 0) or None
+
+    def fmt(t: float | None) -> str:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)) if t else "unknown"
+
+    lines = [
+        FAILURE_MARKER,
+        "",
+        "- order:   %s" % oid,
+        "- session: %s" % (claim.get("session")
+                           or (st.get("sessions") or {}).get(oid) or "unknown"),
+        "- agent pid: %s    window: %s" % (claim.get("pid") or "-", claim.get("window") or "-"),
+        "- started: %s" % fmt(started),
+        "- first seen gone: %s" % fmt(first_seen),
+        "- report written:  %s" % fmt(now),
+        "",
+        "The agent started for this order is gone - its process and its window are both gone",
+        "- and no report had appeared after a %ds grace, so the watcher is recording it."
+        % int(grace),
+        "Nothing was restarted, and the order is remembered as failed, so a repeated block",
+        "for this id will not start another agent.",
+        "",
+        "To run this order again:",
+        "  python3 %s --requeue %s" % (os.path.join(HOME, "watcher.py"), oid),
+        "",
+        "Last %d line(s) of %s (the watcher's own log; it keeps no separate per-agent "
+        "file, so these are the lines that mention %s):" % (len(tail), LOG, oid),
+        "```",
+        *tail,
+        "```",
+        "",
+    ]
+    os.makedirs(REPORTS, exist_ok=True)
+    with open(report_file(oid), "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    finish_order(st, oid, status="failed", why="its agent session ended without a report")
+    queued = queue_report(st, oid)
+    release_claim(oid, "reports/%s.md is a failure report" % oid)
+    log("%s - %s's session ended without a report; wrote %s%s"
+        % (FAILURE_MARKER, oid, os.path.basename(report_file(oid)),
+           (", queued for the planner" if queued else "")))
+    return report_file(oid)
+
+
 def _agent_pid(sid: str) -> int:
     """The pid of the agent's own view, when we can see it - what makes a claim stale."""
     try:
@@ -1443,7 +1645,8 @@ def dispatch_batch(cfg: dict, st: dict, orders: list[dict], dry_run: bool = Fals
 def attention_needed(routed: dict, text: str) -> bool:
     """Would this message need an ask at all?  Deliberately cheap: no API calls,
     so the watcher only checks whether an agent is busy when it has to."""
-    if routed.get("dispatch") or routed.get("ignored") or routed.get("reported"):
+    if routed.get("dispatch") or routed.get("ignored") or routed.get("reported") \
+            or routed.get("ledger"):
         return False
     return bool(routed.get("incomplete") or routed.get("duplicate")
                 or looks_like_work_promise(text))
@@ -2143,7 +2346,7 @@ def reap_windows(cfg: dict, st: dict, activity: list[dict] | None = None,
     return closed
 
 
-def finish_order(st: dict, oid: str) -> None:
+def finish_order(st: dict, oid: str, status: str = "reported", why: str = "") -> None:
     """Mark an order finished: frees its agent slot and stops any resume.
 
     Nothing in the loop can *see* the agent report DONE - it goes to the planner - so
@@ -2151,12 +2354,42 @@ def finish_order(st: dict, oid: str) -> None:
     file, or the report in the agent's own transcript), and a human says so for the
     rest (``watcher.sh done WO-111``).  Memory-wise that is the difference between a
     slot freed now and one freed two hours from now.
+
+    Every finish also enters the order id in the ledger (``status``, ``reported`` by
+    default, or ``failed`` for a session that ended without a report): the ledger is what
+    stops a repeated block for an id that has already run from starting a second agent.
     """
     st.setdefault("finished", {})[oid] = time.time()
     (st.get("resume") or {}).pop(oid, None)
     (st.get("held") or {}).pop(oid, None)
     (st.get("waiting") or {}).pop(oid, None)
+    ledger_add(st, oid, status, why)
     save_state(st)
+
+
+def _clear_failure_report(oid: str) -> bool:
+    """Delete a failure report *this watcher* wrote, so a requeue can start a fresh agent.
+
+    Only the watcher's own file - one whose first line is :data:`FAILURE_MARKER` - is
+    removed.  A real DONE report is the person's to read and keep, and a requeue of an
+    order that genuinely reported stays blocked by it (rule 4).  Returns ``True`` when a
+    failure report was there and is now gone.
+    """
+    path = report_file(oid)
+    try:
+        with open(path) as fh:
+            first = (fh.readline() or "").strip()
+    except Exception:
+        return False
+    if not first.startswith(FAILURE_MARKER):
+        return False
+    try:
+        os.remove(path)
+        log("  removed %s - it was a failure report, and %s is being re-queued"
+            % (os.path.basename(path), oid))
+        return True
+    except Exception:
+        return False
 
 
 def requeue_order(st: dict, oid: str) -> bool:
@@ -2167,13 +2400,32 @@ def requeue_order(st: dict, oid: str) -> bool:
     ``attempts``, the ``last_error``, the retry clock and the finish mark, and drops any
     claim a failed start may have left behind (nothing was started, so it protects
     nothing).  Returns ``True`` when there was a start record to reset.
+
+    It also clears this id's ledger entry --- that entry is what makes a repeated block
+    harmless, so requeue is the one command that may put the id back in play --- forgets
+    the session it was on (a silent death's session is dead; keeping it would make
+    ``ensure_started`` hand the dead id back instead of starting a fresh agent), clears
+    the seen mark so a repeated block is dispatchable again, and deletes a failure report
+    this watcher wrote (only that one: a real DONE report is the person's to keep).
     """
     rec = (st.get("starts") or {}).get(oid)
+    had_ledger = ledger_clear(st, oid)
     if not rec:
-        return False
+        if had_ledger:
+            save_state(st)
+        return had_ledger
     (st.get("finished") or {}).pop(oid, None)
     (st.get("held") or {}).pop(oid, None)
     (st.get("waiting") or {}).pop(oid, None)
+    st.setdefault("sessions", {})[oid] = ""      # merge-safe: a popped key would come back
+    # "" rather than a pop: save_state unions the record's keys too, so a removed `session`
+    # would come back on the next save (the same trap as `first_attempt_at` below)
+    rec["session"] = ""
+    # the seen mark is set to "" rather than popped: save_state unions *with* the file, and
+    # a key we removed would come back on the next save (see the first_attempt_at note below)
+    if isinstance(st.get("orders"), dict):
+        st["orders"][oid] = ""
+    _clear_failure_report(oid)
     rec["status"] = "pending"
     rec["attempts"] = 0
     rec["last_error"] = None
@@ -2359,6 +2611,7 @@ def _give_up(oid: str, st: dict, rec: dict, attempts: int) -> None:
     rec["status"] = "failed"
     rec["next_attempt_at"] = 0
     rec["updated"] = _now()
+    ledger_add(st, oid, "failed", "the start failed %d time(s) - no agent was started" % attempts)
     save_state(st)
     release_claim(oid, "the start failed %d time(s) - no agent was started" % attempts)
 
@@ -2391,6 +2644,7 @@ def ensure_started(cfg: dict, st: dict, oid: str, delay: float | None = None) ->
         log("  not starting an agent for %s: reports/%s.md is already on disk" % (oid, oid))
         rec["status"] = "reported"
         rec["updated"] = time.time()
+        ledger_add(st, oid, "reported", "reports/%s.md was already on disk" % oid)
         save_state(st)
         return None
     # one process per order, enforced before any API call: the claim is the only thing that
@@ -2589,6 +2843,16 @@ def handle_orders(cfg: dict, st: dict, orders: list[dict], files: list[dict] | N
     orders, _held = dispatch_batch(cfg, st, orders, dry_run=dry_run, activity=activity)
 
     for o in orders:
+        if ledger_has(st, o["id"]):
+            # a repeated block for an id that already reported or failed: logged and dropped,
+            # never a second agent (WO-236, WO-238 and WO-249 were re-dispatched this way on
+            # 2026-11-18).  Only `requeue` clears the entry.
+            log_once("ledger-%s" % o["id"],
+                     "ignoring %s - the ledger says it already %s, so this repeat of its "
+                     "block starts nothing (run 'watcher.sh requeue %s' to run it once more)"
+                     % (o["id"], (ledger_get(st, o["id"]) or {}).get("status") or "ran",
+                        o["id"]), every=6 * 3600)
+            continue
         problems = order_problems(o)
         if problems:
             # belt and braces: route_orders already filters these out, but no path
@@ -2599,6 +2863,8 @@ def handle_orders(cfg: dict, st: dict, orders: list[dict], files: list[dict] | N
         # dispatching it again would spend an agent on finished work
         if os.path.exists(report_file(o["id"])):
             log("  ignoring %s - reports/%s.md is already on disk" % (o["id"], o["id"]))
+            ledger_add(st, o["id"], "reported", "reports/%s.md was already on disk" % o["id"])
+            save_state(st)
             continue
         inbox_path = order_to_inbox(o, files)
         log("new work order %s -> %s" % (o["id"], inbox_path))
@@ -2668,6 +2934,11 @@ def pass_once(cfg: dict, st: dict, dry_run: bool = False) -> dict:
                                check=lambda oid, sid, moved: reported_done(cfg, sid, moved))
         resume_stalled(cfg, st, activity, restarted, dry_run=dry_run)
         reap_windows(cfg, st, activity, dry_run=dry_run)
+    # A claim whose agent has died with no report is silent today (:func:`detect_silent_deaths`):
+    # after a grace it leaves one failure report and releases the claim.  It runs after the
+    # report scan so a report that has just arrived is respected, and even when the bridge is
+    # down, because the whole point is that nobody is watching for this one.
+    detect_silent_deaths(cfg, st, dry_run=dry_run)
     if not cdp_alive():
         if cfg.get("watch", {}).get("auto_launch_bridge", False) and ensure_chrome():
             log("bridge window was down - launched it")
@@ -2737,6 +3008,15 @@ def pass_once(cfg: dict, st: dict, dry_run: bool = False) -> dict:
     for m in msgs:
         orders.extend(extract_work_orders(m))
     routed = route_orders(st, orders)
+    # A block posted again for an id that already reached reported or failed is dropped by
+    # the ledger (:func:`route_orders` puts it in its own bucket): say so - once per order -
+    # and start nothing.  Only `requeue` clears the entry.
+    for o in routed.get("ledger") or []:
+        log_once("ledger-%s" % o["id"],
+                 "ignoring %s - the ledger says it already %s, so this repeat of its block "
+                 "starts nothing (run 'watcher.sh requeue %s' to run it once more)"
+                 % (o["id"], (ledger_get(st, o["id"]) or {}).get("status") or "ran", o["id"]),
+                 every=6 * 3600)
     close_self_reported_orders(st, routed.get("reported") or [], dry_run=dry_run)
     new = routed["dispatch"]
     # An order finished a week ago needs nothing but its `finished` mark, and its start

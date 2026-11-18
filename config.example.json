@@ -29,6 +29,7 @@
     "resume_max_per_pass": 2,
     "resume_cooldown_seconds": 1800,
     "resume_max_age_seconds": 21600,
-    "reap_idle_seconds": 7200
+    "reap_idle_seconds": 7200,
+    "silent_death_grace_seconds": 90
   }
 }
